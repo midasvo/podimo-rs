@@ -23,8 +23,8 @@ http = "1"
 http-body-util = "0.1"
 
 # Async
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util", "fs"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util", "fs", "process"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 futures = "0.3"
 
 # Outbound HTTP

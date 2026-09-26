@@ -1,20 +1,46 @@
-//! HLS → ADTS AAC remux for podcast episodes.
+//! HLS → progressive audio for podcast episodes.
 //!
 //! Podimo serves episode audio as HLS: a master playlist with a few bitrate
 //! variants, each a media playlist of ~10 s MPEG-TS segments carrying AAC.
-//! Podcatchers want a single progressive file, so `/stream/<id>.aac` walks the
-//! highest-bandwidth variant, strips the TS/PES framing and streams the raw
-//! ADTS frames back-to-back. No re-encoding, so no ffmpeg and no quality loss.
+//! Podcatchers want a single progressive file, so we walk the
+//! highest-bandwidth variant, strip the TS/PES framing to get raw ADTS AAC,
+//! and (for the feed's `.mp3` enclosures) pipe that through `ffmpeg` to MP3.
+//! ffmpeg only ever sees stdin/stdout; all network I/O stays in here.
 
+use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use futures::{Stream, StreamExt};
+use once_cell::sync::Lazy;
 use reqwest::{Client, Url};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{ChildStdin, Command};
+use tokio::sync::Semaphore;
+use tokio_util::io::ReaderStream;
+use tokio_util::task::AbortOnDropHandle;
 
-/// Content type of the remuxed stream.
-pub const STREAM_CONTENT_TYPE: &str = "audio/aac";
+/// Content type of the remuxed AAC stream.
+pub const AAC_CONTENT_TYPE: &str = "audio/aac";
+/// Content type of the transcoded MP3 stream.
+pub const MP3_CONTENT_TYPE: &str = "audio/mpeg";
+
+/// Looked up on `PATH`; the Docker image installs Debian's ffmpeg.
+const FFMPEG: &str = "ffmpeg";
+/// CBR bitrate of the MP3 transcode. The source is ~320 kbps AAC; 192 kbps
+/// MP3 is transparent for speech and keeps downloads reasonably small.
+const MP3_BITRATE: &str = "192k";
+/// Simultaneous ffmpeg processes; further requests wait for a free slot.
+const MAX_CONCURRENT_TRANSCODES: usize = 4;
+/// How much of ffmpeg's stderr to keep for the error message.
+const STDERR_TAIL_BYTES: usize = 2048;
+
+static TRANSCODE_SLOTS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSCODES)));
 
 /// Only playlists on Podimo's own hosts are proxied, so `/stream` can't be
 /// abused as an open relay.
@@ -41,6 +67,8 @@ pub enum HlsError {
     Unsupported(String),
     #[error("demux: {0}")]
     Demux(&'static str),
+    #[error("transcode: {0}")]
+    Transcode(String),
 }
 
 /// True when `url` points at an HLS playlist rather than a progressive file.
@@ -49,13 +77,27 @@ pub fn is_hls_url(url: &str) -> bool {
     path.ends_with(".m3u8")
 }
 
-/// The proxy URL a feed enclosure should point at for an HLS episode.
-pub fn stream_enclosure_url(base_url: &str, episode_id: &str, hls_url: &str) -> String {
+/// The proxy URL a feed enclosure should point at for an HLS episode:
+/// `{base}/stream/<token>/<episode_id>.mp3`, where `token` is the signed
+/// playlist URL in unpadded base64url. Keeping it in the path means the URL
+/// ends in a plain `.mp3` with no query string, so clients that sniff the
+/// extension (Audiobookshelf does) never see the `.m3u8` inside it.
+pub fn mp3_enclosure_url(base_url: &str, episode_id: &str, hls_url: &str) -> String {
     format!(
-        "{base_url}/stream/{}.aac?src={}",
-        urlencoding::encode(episode_id),
-        urlencoding::encode(hls_url)
+        "{base_url}/stream/{}/{}.mp3",
+        URL_SAFE_NO_PAD.encode(hls_url),
+        urlencoding::encode(episode_id)
     )
+}
+
+/// Inverse of the token in [`mp3_enclosure_url`]. The result still needs
+/// [`validate_source`].
+pub fn decode_source_token(token: &str) -> Result<String, HlsError> {
+    URL_SAFE_NO_PAD
+        .decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or(HlsError::InvalidSource("malformed token"))
 }
 
 /// Parse and vet the `src` query parameter of a `/stream` request.
@@ -154,6 +196,142 @@ pub fn aac_stream(
             demuxer.push(&segment, &mut out)?;
             Ok(Bytes::from(out))
         })
+}
+
+/// Transcode an ADTS AAC stream to MP3 with ffmpeg, streaming the output as
+/// it's produced. Waits for a free transcode slot before starting ffmpeg.
+///
+/// Failures — upstream errors in `aac` as well as ffmpeg itself failing —
+/// arrive as a trailing `Err` item, so the response is cut short instead of
+/// ending in a truncated MP3 that looks complete. Dropping the stream (the
+/// client went away) kills ffmpeg and stops the upstream fetch.
+pub async fn transcode_to_mp3<S>(
+    aac: S,
+) -> Result<impl Stream<Item = Result<Bytes, HlsError>>, HlsError>
+where
+    S: Stream<Item = Result<Bytes, HlsError>> + Send + 'static,
+{
+    let permit = TRANSCODE_SLOTS
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("transcode semaphore is never closed");
+
+    let mut child = Command::new(FFMPEG)
+        .args([
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "error",
+            "-f",
+            "aac",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            MP3_BITRATE,
+            "-f",
+            "mp3",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|err| HlsError::Transcode(format!("could not start {FFMPEG}: {err}")))?;
+    let stdin = child.stdin.take().expect("stdin is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+
+    let feeder = AbortOnDropHandle::new(tokio::spawn(feed_ffmpeg(aac, stdin)));
+    // Drained concurrently: a chatty ffmpeg would otherwise block on a full
+    // stderr pipe and stall the transcode.
+    let stderr_tail = AbortOnDropHandle::new(tokio::spawn(read_tail(stderr)));
+
+    let output = ReaderStream::with_capacity(stdout, 64 * 1024).map(|chunk| {
+        chunk.map_err(|err| HlsError::Transcode(format!("reading ffmpeg output: {err}")))
+    });
+
+    // Polled once ffmpeg has closed stdout, i.e. when it's finished.
+    let outcome = futures::stream::once(async move {
+        let _permit = permit;
+        let status = child
+            .wait()
+            .await
+            .map_err(|err| HlsError::Transcode(format!("waiting for ffmpeg: {err}")))?;
+        if !status.success() {
+            let stderr = stderr_tail.await.unwrap_or_default();
+            return Err(HlsError::Transcode(format!(
+                "ffmpeg exited with {status}: {stderr}"
+            )));
+        }
+        // A clean exit means ffmpeg saw EOF on stdin, so the feeder is done;
+        // this surfaces an upstream error that cut the input short.
+        feeder
+            .await
+            .map_err(|err| HlsError::Transcode(format!("feeding ffmpeg: {err}")))?
+    })
+    .filter_map(|outcome| async move { outcome.err().map(Err) });
+
+    Ok(output.chain(outcome))
+}
+
+/// Log which ffmpeg will do the MP3 transcodes, or warn that there is none,
+/// so a missing binary shows up at startup instead of on the first download.
+pub async fn log_ffmpeg_status() {
+    let result = Command::new(FFMPEG)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    match result {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let version: Vec<&str> = stdout.split_whitespace().take(3).collect();
+            tracing::info!(target: "podimo", "MP3 transcoding via {}", version.join(" "));
+        }
+        Ok(out) => tracing::warn!(
+            target: "podimo",
+            "`{FFMPEG} -version` failed ({}); HLS episodes can't be served as MP3",
+            out.status
+        ),
+        Err(err) => tracing::warn!(
+            target: "podimo",
+            "{FFMPEG} not found ({err}); HLS episodes can't be served as MP3"
+        ),
+    }
+}
+
+async fn feed_ffmpeg<S>(aac: S, mut stdin: ChildStdin) -> Result<(), HlsError>
+where
+    S: Stream<Item = Result<Bytes, HlsError>>,
+{
+    let mut aac = std::pin::pin!(aac);
+    while let Some(chunk) = aac.next().await {
+        stdin
+            .write_all(&chunk?)
+            .await
+            .map_err(|err| HlsError::Transcode(format!("writing to ffmpeg: {err}")))?;
+    }
+    // Returning drops stdin, closing the pipe: ffmpeg sees EOF and flushes.
+    Ok(())
+}
+
+/// Read `stream` to the end, keeping the last few KB as text.
+async fn read_tail(mut stream: impl AsyncRead + Unpin) -> String {
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n @ 1..) = stream.read(&mut buf).await {
+        tail.extend_from_slice(&buf[..n]);
+        let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+        tail.drain(..excess);
+    }
+    String::from_utf8_lossy(&tail).trim().to_string()
 }
 
 async fn fetch_text(client: &Client, url: &Url) -> Result<String, HlsError> {
@@ -487,11 +665,112 @@ mod tests {
     }
 
     #[test]
-    fn stream_enclosure_url_encodes_source() {
-        let url = stream_enclosure_url("http://host:1", "ep-1", "https://x/a.m3u8?a=1&b=2");
-        assert_eq!(
-            url,
-            "http://host:1/stream/ep-1.aac?src=https%3A%2F%2Fx%2Fa.m3u8%3Fa%3D1%26b%3D2"
+    fn mp3_enclosure_url_is_a_plain_mp3_path_carrying_the_playlist() {
+        let src = "https://media-cdn-episodes.podimo.com/a/a.m3u8?u=1&KeyName=k&Signature=s";
+        let url = mp3_enclosure_url("http://host:1", "ep-1", src);
+        assert!(url.starts_with("http://host:1/stream/"), "{url}");
+        assert!(url.ends_with("/ep-1.mp3"), "{url}");
+        assert!(!url.contains('?') && !url.contains(".m3u8"), "{url}");
+
+        let token = url
+            .trim_start_matches("http://host:1/stream/")
+            .trim_end_matches("/ep-1.mp3");
+        assert_eq!(decode_source_token(token).unwrap(), src);
+    }
+
+    #[test]
+    fn decode_source_token_rejects_garbage() {
+        assert!(decode_source_token("not base64!").is_err());
+        assert!(decode_source_token(&URL_SAFE_NO_PAD.encode([0xFF, 0xFE])).is_err());
+    }
+
+    /// `seconds` of a 440 Hz tone as ADTS AAC, generated by ffmpeg itself.
+    fn adts_tone(seconds: u32) -> Vec<u8> {
+        let out = std::process::Command::new(FFMPEG)
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg(format!("sine=frequency=440:duration={seconds}"))
+            .args(["-c:a", "aac", "-b:a", "128k", "-f", "adts", "pipe:1"])
+            .output()
+            .expect("the transcode tests need ffmpeg on PATH");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
         );
+        out.stdout
+    }
+
+    /// The first `n` whole ADTS frames of `aac`.
+    fn adts_prefix(aac: &[u8], n: usize) -> &[u8] {
+        let mut end = 0;
+        for _ in 0..n {
+            let h = &aac[end..];
+            end += (usize::from(h[3] & 0x03) << 11)
+                | (usize::from(h[4]) << 3)
+                | usize::from(h[5] >> 5);
+        }
+        &aac[..end]
+    }
+
+    async fn collect(
+        stream: impl Stream<Item = Result<Bytes, HlsError>>,
+    ) -> (Vec<u8>, Option<HlsError>) {
+        let mut stream = std::pin::pin!(stream);
+        let mut body = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => body.extend_from_slice(&chunk),
+                Err(err) => return (body, Some(err)),
+            }
+        }
+        (body, None)
+    }
+
+    #[tokio::test]
+    async fn transcode_to_mp3_produces_192k_mp3() {
+        let aac = adts_tone(4);
+        // Uneven chunks, like demuxed segments arrive.
+        let chunks: Vec<Result<Bytes, HlsError>> = aac
+            .chunks(7_000)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let stream = transcode_to_mp3(futures::stream::iter(chunks))
+            .await
+            .unwrap();
+        let (mp3, err) = collect(stream).await;
+        assert!(err.is_none(), "{err:?}");
+
+        // ID3v2 tag, then MPEG-1 Layer III frames at 192 kbps (index 0xB).
+        assert_eq!(&mp3[..3], b"ID3");
+        let tag_len = mp3[6..10]
+            .iter()
+            .fold(0usize, |acc, b| (acc << 7) | usize::from(*b));
+        let frame = &mp3[10 + tag_len..];
+        assert_eq!(frame[..2], [0xFF, 0xFB], "MPEG-1 Layer III frame header");
+        assert_eq!(frame[2] >> 4, 0xB, "192 kbps");
+        // ~4 s at 24 KB/s, plus encoder delay and padding.
+        assert!((90_000..110_000).contains(&mp3.len()), "size {}", mp3.len());
+    }
+
+    #[tokio::test]
+    async fn transcode_to_mp3_ends_in_the_upstream_error() {
+        let aac = adts_tone(2);
+        let input = futures::stream::iter(vec![
+            Ok(Bytes::copy_from_slice(adts_prefix(&aac, 40))),
+            Err(HlsError::Upstream("segment gone".into())),
+        ]);
+        let (mp3, err) = collect(transcode_to_mp3(input).await.unwrap()).await;
+        assert!(matches!(err, Some(HlsError::Upstream(_))), "{err:?}");
+        assert!(
+            !mp3.is_empty(),
+            "audio before the failure is still streamed"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_to_mp3_reports_ffmpeg_failure() {
+        let input = futures::stream::iter(vec![Ok(Bytes::from_static(&[0x42; 4096]))]);
+        let (_, err) = collect(transcode_to_mp3(input).await.unwrap()).await;
+        assert!(matches!(err, Some(HlsError::Transcode(_))), "{err:?}");
     }
 }

@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use podimo_rs::cache::{HeadInfo, TtlCache};
 use podimo_rs::podimo::rss::{audiobook_to_rss, podcasts_to_rss};
 use reqwest::Client;
@@ -411,13 +413,17 @@ async fn podcasts_to_rss_routes_hls_episodes_through_stream_proxy() {
     .await
     .expect("render");
 
+    let token = URL_SAFE_NO_PAD
+        .encode("https://media-cdn-episodes.podimo.com/ep1/ep1.m3u8?u=x&KeyName=k&Signature=s");
     assert!(
-        rss.contains(
-            "url=\"http://proxy.test/stream/ep1.aac?src=https%3A%2F%2Fmedia-cdn-episodes.podimo.com%2Fep1%2Fep1.m3u8%3Fu%3Dx%26KeyName%3Dk%26Signature%3Ds\""
-        ),
-        "enclosure should point at the stream proxy: {rss}"
+        rss.contains(&format!("url=\"http://proxy.test/stream/{token}/ep1.mp3\"")),
+        "enclosure should point at the MP3 stream proxy: {rss}"
     );
-    assert!(rss.contains("type=\"audio/aac\""), "{rss}");
+    assert!(rss.contains("type=\"audio/mpeg\""), "{rss}");
+    assert!(
+        !rss.contains(".m3u8"),
+        "no playlist URL may leak into the feed: {rss}"
+    );
     assert!(!rss.contains("audio/x-mpegurl"), "{rss}");
     assert!(rss.contains("<itunes:duration>1234</itunes:duration>"));
 }

@@ -12,6 +12,7 @@ async fn main() -> anyhow::Result<()> {
 
     telemetry::init(config.debug);
     config.log_startup();
+    podimo_rs::podimo::hls::log_ffmpeg_status().await;
 
     let addr: SocketAddr = config
         .bind_host

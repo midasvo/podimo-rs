@@ -71,7 +71,9 @@ services:
 ## Run from source
 
 Requires a Rust toolchain (1.80+). [rustup](https://rustup.rs) is the usual
-install path.
+install path. Podimo now serves episodes as HLS, which the proxy converts to
+MP3 with [ffmpeg](https://ffmpeg.org), so `ffmpeg` must be on your `PATH`
+too (the Docker image includes it).
 
 ```sh
 git clone https://github.com/midasvo/podimo-ce        # repo name is `podimo-ce`; binary is `podimo-rs`
