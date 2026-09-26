@@ -12,17 +12,20 @@ use serde_json::Value;
 
 use crate::cache::{HeadInfo, TtlCache};
 use crate::podimo::head::url_head_info;
+use crate::podimo::hls::{is_hls_url, stream_enclosure_url, STREAM_CONTENT_TYPE};
 use crate::util::jpg_fragment;
 
 const ITUNES_NS: &str = "http://www.itunes.com/dtds/podcast-1.0.dtd";
 const CONCURRENT_HEAD_PROBES: usize = 10;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn podcasts_to_rss(
     payload: &Value,
     podcast_id: &str,
     locale: &str,
     public_feeds: bool,
     limit: Option<usize>,
+    stream_base_url: &str,
     scraper: &Client,
     head_cache: &TtlCache<HeadInfo>,
 ) -> anyhow::Result<String> {
@@ -73,7 +76,7 @@ pub async fn podcasts_to_rss(
         let batch = join_all(
             chunk
                 .iter()
-                .map(|ep| build_item(scraper, head_cache, ep, locale)),
+                .map(|ep| build_item(scraper, head_cache, ep, locale, stream_base_url)),
         )
         .await;
         for res in batch {
@@ -303,6 +306,7 @@ async fn build_item(
     head_cache: &TtlCache<HeadInfo>,
     episode: &Value,
     locale: &str,
+    stream_base_url: &str,
 ) -> anyhow::Result<Option<rss::Item>> {
     let id = episode.get("id").and_then(|v| v.as_str()).unwrap_or("?");
     let title = episode
@@ -326,21 +330,32 @@ async fn build_item(
         return Ok(None);
     };
 
-    // url_head_info already bounds total time via RETRIES * TIMEOUT_PER_TRY +
-    // backoff; no outer timeout needed.
-    let head = url_head_info(scraper, head_cache, id, &audio_url, locale)
-        .await
-        .map_err(|err| anyhow::anyhow!("HEAD probe failed for episode {id}: {err}"))?;
+    let enclosure = if is_hls_url(&audio_url) {
+        // HLS playlists are useless to podcatchers; point at our remuxing
+        // proxy instead. The remuxed size isn't known up front, and 0 is the
+        // conventional "unknown" enclosure length.
+        EnclosureBuilder::default()
+            .url(stream_enclosure_url(stream_base_url, id, &audio_url))
+            .length("0".to_string())
+            .mime_type(STREAM_CONTENT_TYPE.to_string())
+            .build()
+    } else {
+        // url_head_info already bounds total time via RETRIES * TIMEOUT_PER_TRY +
+        // backoff; no outer timeout needed.
+        let head = url_head_info(scraper, head_cache, id, &audio_url, locale)
+            .await
+            .map_err(|err| anyhow::anyhow!("HEAD probe failed for episode {id}: {err}"))?;
+        EnclosureBuilder::default()
+            .url(audio_url.clone())
+            .length(head.content_length)
+            .mime_type(head.content_type)
+            .build()
+    };
 
     let image_url = episode
         .get("imageUrl")
         .and_then(|v| v.as_str())
         .map(jpg_fragment);
-    let enclosure = EnclosureBuilder::default()
-        .url(audio_url.clone())
-        .length(head.content_length)
-        .mime_type(head.content_type)
-        .build();
 
     let mut itunes_item = ITunesItemExtensionBuilder::default();
     if duration > 0 {
@@ -367,8 +382,8 @@ async fn build_item(
     Ok(Some(item))
 }
 
-/// Returns `(Option<url>, duration_seconds)` from an episode object,
-/// rewriting HLS URLs to the equivalent MP3 stream where possible.
+/// Returns `(Option<url>, duration_seconds)` from an episode object. The URL
+/// may be an HLS playlist; `build_item` routes those through `/stream`.
 fn extract_audio_url(episode: &Value) -> (Option<String>, i64) {
     let audio = episode.get("audio");
     let url = audio
@@ -387,19 +402,12 @@ fn extract_audio_url(episode: &Value) -> (Option<String>, i64) {
 
     let stream = episode.get("streamMedia");
     if let Some(stream) = stream {
-        let mut url = stream
+        let url = stream
             .get("url")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         let duration = stream.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
-        if let Some(ref mut u) = url {
-            if u.contains("hls-media") && u.contains("/main.m3u8") {
-                *u = u
-                    .replace("hls-media", "audios")
-                    .replace("/main.m3u8", ".mp3");
-            }
-        }
         return (url, duration);
     }
     (None, 0)
@@ -446,21 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_audio_url_rewrites_hls_to_mp3() {
+    fn extract_audio_url_passes_hls_through() {
+        let hls = "https://media-cdn-episodes.podimo.com/ep/ep.m3u8?sig=x";
         let ep = json!({
             "audio": null,
-            "streamMedia": {
-                "url": "https://hls-media.podimo.com/foo/bar/main.m3u8?sig=x",
-                "duration": 60
-            },
+            "streamMedia": {"url": hls, "duration": 60},
         });
-        let (url, dur) = extract_audio_url(&ep);
-        assert_eq!(dur, 60);
-        let url = url.unwrap();
-        assert!(url.contains("audios"), "url should contain 'audios': {url}");
-        assert!(url.contains(".mp3"), "url should contain '.mp3': {url}");
-        assert!(!url.contains("hls-media"));
-        assert!(!url.contains("/main.m3u8"));
+        assert_eq!(extract_audio_url(&ep), (Some(hls.into()), 60));
     }
 
     #[test]

@@ -13,6 +13,9 @@ Endpoints:
   the latest N episodes.
 - `GET /audiobook/<audiobook_id>.xml` — single-item RSS feed for one Podimo
   audiobook (the book itself is the lone episode).
+- `GET /stream/<episode_id>.aac?src=<signed .m3u8>` — remuxes an HLS episode
+  into one progressive ADTS AAC stream. Feed enclosures point here for any
+  episode whose audio URL is an `.m3u8` (see "HLS episodes" below).
 - `GET /library` + `/library/*` — opt-in audiobook library (downloads books
   to disk for permanent local storage). Requires `ENABLE_LIBRARY=true` +
   `LOCAL_CREDENTIALS=true`.
@@ -63,6 +66,7 @@ Docker build matches CI: `docker build -t podimo-rs:test .` then
 │       │   │   ├── feed.rs          # GET /feed/<id>.xml
 │       │   │   ├── audiobook.rs     # GET /audiobook/<id>.xml
 │       │   │   ├── library.rs       # GET /library + /library/* (opt-in)
+│       │   │   ├── stream.rs        # GET /stream/<id>.aac (HLS → AAC remux)
 │       │   │   └── not_found.rs     # fallback
 │       │   ├── library/
 │       │   │   ├── mod.rs           # Library struct + on-disk hydration
@@ -71,6 +75,7 @@ Docker build matches CI: `docker build -t podimo-rs:test .` then
 │       │   ├── podimo/
 │       │   │   ├── client.rs        # GraphQL login + getPodcasts + audiobook queries
 │       │   │   ├── head.rs          # episode HEAD probe with retries
+│       │   │   ├── hls.rs           # m3u8 parsing + MPEG-TS → ADTS demux
 │       │   │   └── rss.rs           # podcasts_to_rss + audiobook_to_rss
 │       │   ├── cache.rs             # TtlCache + on-disk bincode persistence
 │       │   ├── blocklist.rs
@@ -114,6 +119,24 @@ Feed request flow:
 5. `podimo::rss::podcasts_to_rss` builds RSS via the `rss` crate's iTunes
    extensions and runs `url_head_info` HEAD probes for enclosure metadata in
    chunks of 10 concurrent requests.
+
+### HLS episodes (`podimo/hls.rs`, `handlers/stream.rs`)
+
+Podimo no longer returns a progressive `audio.url`; `streamMedia.url`
+is a signed master playlist on `media-cdn-episodes.podimo.com` (192k/320k
+variants of ~10 s MPEG-TS segments carrying AAC-LC, unencrypted). No MP3
+sibling is reachable on the CDN.
+
+`podcasts_to_rss` rewrites such enclosures to
+`{PODIMO_PROTOCOL}://{PODIMO_HOSTNAME}/stream/<id>.aac?src=<url-encoded m3u8>`
+with `type="audio/aac"` and `length="0"` (size unknown up front; no HEAD
+probe). `/stream` needs no auth — the signed `src` is the credential — but
+only accepts `https` playlists on `*.podimo.com`. It picks the
+highest-`BANDWIDTH` variant, fetches segments 4 ahead with retries, and a
+tiny TS demuxer (PAT → PMT → stream_type 0x0F → PES payloads) emits raw ADTS.
+No re-encoding, no ffmpeg. The body is chunked; `Range` is ignored (200 with
+the full stream), so in-stream seeking before download completes is up to
+the client.
 
 ### Library flow (opt-in)
 

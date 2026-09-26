@@ -21,7 +21,9 @@ pub(crate) async fn after_request(
     let headers = response.headers_mut();
 
     if matches!(method, Method::GET | Method::HEAD)
-        && (path.starts_with("/feed/") || path.starts_with("/audiobook/"))
+        && (path.starts_with("/feed/")
+            || path.starts_with("/audiobook/")
+            || path.starts_with("/stream/"))
     {
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_ORIGIN,
