@@ -13,9 +13,10 @@ Endpoints:
   the latest N episodes.
 - `GET /audiobook/<audiobook_id>.xml` — single-item RSS feed for one Podimo
   audiobook (the book itself is the lone episode).
-- `GET /stream/<episode_id>.aac?src=<signed .m3u8>` — remuxes an HLS episode
-  into one progressive ADTS AAC stream. Feed enclosures point here for any
-  episode whose audio URL is an `.m3u8` (see "HLS episodes" below).
+- `GET /stream/<token>/<episode_id>.mp3` — transcodes an HLS episode to one
+  progressive MP3 (ffmpeg). Feed enclosures point here for any episode whose
+  audio URL is an `.m3u8` (see "HLS episodes" below). The older
+  `GET /stream/<episode_id>.aac?src=…` AAC remux is kept for stored URLs.
 - `GET /library` + `/library/*` — opt-in audiobook library (downloads books
   to disk for permanent local storage). Requires `ENABLE_LIBRARY=true` +
   `LOCAL_CREDENTIALS=true`.
@@ -66,7 +67,7 @@ Docker build matches CI: `docker build -t podimo-rs:test .` then
 │       │   │   ├── feed.rs          # GET /feed/<id>.xml
 │       │   │   ├── audiobook.rs     # GET /audiobook/<id>.xml
 │       │   │   ├── library.rs       # GET /library + /library/* (opt-in)
-│       │   │   ├── stream.rs        # GET /stream/<id>.aac (HLS → AAC remux)
+│       │   │   ├── stream.rs        # GET /stream/<token>/<id>.mp3 (HLS → MP3)
 │       │   │   └── not_found.rs     # fallback
 │       │   ├── library/
 │       │   │   ├── mod.rs           # Library struct + on-disk hydration
@@ -92,7 +93,8 @@ Docker build matches CI: `docker build -t podimo-rs:test .` then
 │           ├── integration_audiobook.rs            # audiobook validation + middleware
 │           ├── integration_audiobook_upstream.rs   # wiremock-mocked audiobook flow
 │           ├── integration_head.rs                 # wiremock-mocked HEAD probe
-│           └── integration_rss.rs                  # structural RSS rendering
+│           ├── integration_rss.rs                  # structural RSS rendering
+│           └── integration_stream.rs               # /stream routing + validation
 ```
 
 Feed request flow:
@@ -128,15 +130,27 @@ variants of ~10 s MPEG-TS segments carrying AAC-LC, unencrypted). No MP3
 sibling is reachable on the CDN.
 
 `podcasts_to_rss` rewrites such enclosures to
-`{PODIMO_PROTOCOL}://{PODIMO_HOSTNAME}/stream/<id>.aac?src=<url-encoded m3u8>`
-with `type="audio/aac"` and `length="0"` (size unknown up front; no HEAD
-probe). `/stream` needs no auth — the signed `src` is the credential — but
-only accepts `https` playlists on `*.podimo.com`. It picks the
-highest-`BANDWIDTH` variant, fetches segments 4 ahead with retries, and a
-tiny TS demuxer (PAT → PMT → stream_type 0x0F → PES payloads) emits raw ADTS.
-No re-encoding, no ffmpeg. The body is chunked; `Range` is ignored (200 with
-the full stream), so in-stream seeking before download completes is up to
-the client.
+`{PODIMO_PROTOCOL}://{PODIMO_HOSTNAME}/stream/<token>/<id>.mp3` with
+`type="audio/mpeg"` and `length="0"` (size unknown up front; no HEAD probe).
+`token` is the signed `.m3u8` URL in unpadded base64url: carrying it in the
+path keeps the URL a plain `….mp3` with no query string and no `.m3u8`
+anywhere in it — Audiobookshelf derives the file type from the URL, and raw
+AAC also leaves it guessing the duration (no header to read it from).
+
+`/stream` needs no auth — the signed playlist URL is the credential — but only
+accepts `https` playlists on `*.podimo.com`. It picks the highest-`BANDWIDTH`
+variant, fetches segments 4 ahead with retries, and a tiny TS demuxer (PAT →
+PMT → stream_type 0x0F → PES payloads) turns them into raw ADTS AAC. That is
+piped into `ffmpeg -f aac -i pipe:0 -c:a libmp3lame -b:a 192k -f mp3 pipe:1`
+(stdin/stdout only; ffmpeg never touches the network), at most 4 at a time.
+A failed upstream fetch or ffmpeg failure ends the chunked body with an error
+so clients see a broken download, not a short "complete" one; dropping the
+body kills ffmpeg. `HEAD` resolves the playlists but skips the transcode.
+`Range` is ignored (200 with the full stream).
+
+The earlier `GET /stream/<id>.aac?src=<url-encoded m3u8>` (ADTS AAC, no
+ffmpeg) is still served for enclosure URLs podcatchers stored before the MP3
+switch. `ffmpeg` must be on `PATH`; startup logs its version or a warning.
 
 ### Library flow (opt-in)
 
@@ -276,7 +290,8 @@ to structured JSON output.
 ## Container
 
 Multi-stage Dockerfile: `rust:1.95-slim-bookworm` builder → `debian:bookworm-slim`
-runtime, static-linked-ish via rustls (no OpenSSL dependency). Binary lives at
+runtime, static-linked-ish via rustls (no OpenSSL dependency). The runtime
+stage installs Debian's `ffmpeg` for the MP3 transcode. Binary lives at
 `/usr/local/bin/podimo-rs`, exposes port 12104, `HEALTHCHECK` hits `/healthz`.
 
 CI publishes `ghcr.io/midasvo/podimo-rs` from `main` pushes, semver tags, or

@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::cache::{HeadInfo, TtlCache};
 use crate::podimo::head::url_head_info;
-use crate::podimo::hls::{is_hls_url, stream_enclosure_url, STREAM_CONTENT_TYPE};
+use crate::podimo::hls::{is_hls_url, mp3_enclosure_url, MP3_CONTENT_TYPE};
 use crate::util::jpg_fragment;
 
 const ITUNES_NS: &str = "http://www.itunes.com/dtds/podcast-1.0.dtd";
@@ -331,13 +331,13 @@ async fn build_item(
     };
 
     let enclosure = if is_hls_url(&audio_url) {
-        // HLS playlists are useless to podcatchers; point at our remuxing
-        // proxy instead. The remuxed size isn't known up front, and 0 is the
+        // HLS playlists are useless to podcatchers; point at our MP3
+        // transcode instead. Its size isn't known up front, and 0 is the
         // conventional "unknown" enclosure length.
         EnclosureBuilder::default()
-            .url(stream_enclosure_url(stream_base_url, id, &audio_url))
+            .url(mp3_enclosure_url(stream_base_url, id, &audio_url))
             .length("0".to_string())
-            .mime_type(STREAM_CONTENT_TYPE.to_string())
+            .mime_type(MP3_CONTENT_TYPE.to_string())
             .build()
     } else {
         // url_head_info already bounds total time via RETRIES * TIMEOUT_PER_TRY +
