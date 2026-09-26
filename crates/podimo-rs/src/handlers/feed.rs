@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::error::AppError;
 use crate::handlers::auth::authorize_request;
 use crate::state::AppState;
-use crate::util::amp_arg;
+use crate::util::{amp_arg, request_base_url};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new().route("/feed/:podcast_id", get(serve))
@@ -65,7 +65,11 @@ async fn serve(
         Err(err) => return AppError::Internal(format!("fetch podcasts: {err}")).into_response(),
     };
 
-    let stream_base_url = format!("{}://{}", state.config.protocol, state.config.hostname);
+    // Stream links go back through whatever address this client used for the
+    // feed, so an in-cluster client (e.g. `http://podimo`) and one coming in
+    // through the public reverse proxy each get links they can reach.
+    let fallback = format!("{}://{}", state.config.protocol, state.config.hostname);
+    let stream_base_url = request_base_url(&req_headers, &fallback);
     match crate::podimo::rss::podcasts_to_rss(
         &payload,
         podcast_id,

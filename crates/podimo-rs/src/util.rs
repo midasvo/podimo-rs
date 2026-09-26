@@ -73,6 +73,45 @@ pub(crate) fn parse_basic_auth(headers: &axum::http::HeaderMap) -> Option<(Strin
     Some((user.to_string(), pass.to_string()))
 }
 
+/// `scheme://host[:port]` this request was addressed to, for absolute links
+/// the same client can follow back. Behind a reverse proxy that's
+/// `X-Forwarded-Proto` + `X-Forwarded-Host` (or the passed-through `Host`);
+/// a direct request is plain HTTP, since we don't terminate TLS ourselves.
+/// Falls back to `fallback` when there's no usable host header. Both headers
+/// are client-controlled, but only shape the links in this client's own
+/// response.
+pub(crate) fn request_base_url(headers: &axum::http::HeaderMap, fallback: &str) -> String {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            // Chained proxies append ("a, b"); the first entry faces the client.
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let host = header("x-forwarded-host")
+        .or_else(|| header("host"))
+        .filter(|h| is_plausible_authority(h));
+    let Some(host) = host else {
+        return fallback.to_string();
+    };
+    let scheme = match header("x-forwarded-proto") {
+        Some(proto) if proto.eq_ignore_ascii_case("https") => "https",
+        _ => "http",
+    };
+    format!("{scheme}://{host}")
+}
+
+/// Host names, IPv4/IPv6 literals and ports only; anything else (quotes,
+/// slashes, whitespace) is ignored so it can't reshape the links.
+fn is_plausible_authority(host: &str) -> bool {
+    host.len() <= 255
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._:[]".contains(&b))
+}
+
 /// Detects whether a pasted Podimo URL is an audiobook or a podcast, and
 /// extracts the UUID. A bare UUID (no surrounding URL) defaults to podcast for
 /// backwards compatibility with the old single-content-type form. Returns
@@ -250,6 +289,46 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(amp_arg(|k| m.get(k).copied(), "region"), Some("nl".into()));
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> axum::http::HeaderMap {
+        pairs
+            .iter()
+            .map(|(k, v)| (axum::http::HeaderName::from_static(k), v.parse().unwrap()))
+            .collect()
+    }
+
+    const FALLBACK: &str = "https://fallback.example";
+
+    #[test]
+    fn request_base_url_direct_request_is_plain_http_on_host() {
+        let h = headers(&[("host", "podimo")]);
+        assert_eq!(request_base_url(&h, FALLBACK), "http://podimo");
+        let h = headers(&[("host", "192.168.1.5:12104")]);
+        assert_eq!(request_base_url(&h, FALLBACK), "http://192.168.1.5:12104");
+    }
+
+    #[test]
+    fn request_base_url_follows_reverse_proxy_headers() {
+        let h = headers(&[
+            ("host", "podimo.example.com"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        assert_eq!(request_base_url(&h, FALLBACK), "https://podimo.example.com");
+
+        let h = headers(&[
+            ("host", "podimo:12104"),
+            ("x-forwarded-host", "podimo.example.com, internal"),
+            ("x-forwarded-proto", "HTTPS, http"),
+        ]);
+        assert_eq!(request_base_url(&h, FALLBACK), "https://podimo.example.com");
+    }
+
+    #[test]
+    fn request_base_url_falls_back_without_a_usable_host() {
+        assert_eq!(request_base_url(&headers(&[]), FALLBACK), FALLBACK);
+        let h = headers(&[("host", "evil.example/\"><x")]);
+        assert_eq!(request_base_url(&h, FALLBACK), FALLBACK);
     }
 
     #[test]

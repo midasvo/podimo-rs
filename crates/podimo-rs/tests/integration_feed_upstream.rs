@@ -182,6 +182,49 @@ async fn happy_path_returns_rss() {
 }
 
 #[tokio::test]
+async fn stream_links_follow_the_host_the_feed_was_requested_on() {
+    let server = MockServer::start().await;
+    let mut payload = fake_episodes_payload();
+    let episode = &mut payload["data"]["episodes"][0];
+    episode["audio"] = Value::Null;
+    episode["streamMedia"] = json!({
+        "url": "https://media-cdn-episodes.podimo.com/ep1/ep1.m3u8?u=x&Signature=s",
+        "duration": 1234
+    });
+    install_graphql_mock(&server, ResponseTemplate::new(200).set_body_json(payload)).await;
+
+    let config = make_config(format!("{}/graphql", server.uri()));
+    let state = AppState::new(config).await.unwrap();
+    let (addr, handle) = boot_with_state(state).await;
+
+    let feed = |extra: &'static [(&'static str, &'static str)]| {
+        let mut req = http_client()
+            .get(format!("http://{addr}/feed/{PODCAST_ID}.xml"))
+            .header("Authorization", basic_auth("a@b.com,nl,nl-NL", "pw"));
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        async move { req.send().await.unwrap().text().await.unwrap() }
+    };
+
+    // In-cluster client talking to the service directly.
+    let body = feed(&[("Host", "podimo")]).await;
+    assert!(body.contains("url=\"http://podimo/stream/"), "{body}");
+
+    // Same feed through a TLS-terminating reverse proxy.
+    let body = feed(&[
+        ("Host", "podimo.example.com"),
+        ("X-Forwarded-Proto", "https"),
+    ])
+    .await;
+    assert!(
+        body.contains("url=\"https://podimo.example.com/stream/"),
+        "{body}"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
 async fn podcast_not_found_returns_404() {
     let server = MockServer::start().await;
     install_graphql_mock(

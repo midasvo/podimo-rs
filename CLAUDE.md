@@ -129,13 +129,20 @@ is a signed master playlist on `media-cdn-episodes.podimo.com` (192k/320k
 variants of ~10 s MPEG-TS segments carrying AAC-LC, unencrypted). No MP3
 sibling is reachable on the CDN.
 
-`podcasts_to_rss` rewrites such enclosures to
-`{PODIMO_PROTOCOL}://{PODIMO_HOSTNAME}/stream/<token>/<id>.mp3` with
-`type="audio/mpeg"` and `length="0"` (size unknown up front; no HEAD probe).
-`token` is the signed `.m3u8` URL in unpadded base64url: carrying it in the
-path keeps the URL a plain `….mp3` with no query string and no `.m3u8`
+`podcasts_to_rss` rewrites such enclosures to `<base>/stream/<token>/<id>.mp3`
+with `type="audio/mpeg"` and `length="0"` (size unknown up front; no HEAD
+probe). `token` is the signed `.m3u8` URL in unpadded base64url: carrying it
+in the path keeps the URL a plain `….mp3` with no query string and no `.m3u8`
 anywhere in it — Audiobookshelf derives the file type from the URL, and raw
 AAC also leaves it guessing the duration (no header to read it from).
+
+`<base>` is the address the feed request itself came in on
+(`util::request_base_url`: `X-Forwarded-Proto`/`X-Forwarded-Host` from a
+reverse proxy, else `http://` + `Host`), falling back to
+`{PODIMO_PROTOCOL}://{PODIMO_HOSTNAME}`. A client that can fetch the feed can
+therefore also reach the links: e.g. Audiobookshelf in the same cluster reads
+`http://podimo/feed/…` and gets `http://podimo/stream/…`, while the public
+hostname may resolve to an address pods can't route to.
 
 `/stream` needs no auth — the signed playlist URL is the credential — but only
 accepts `https` playlists on `*.podimo.com`. It picks the highest-`BANDWIDTH`
