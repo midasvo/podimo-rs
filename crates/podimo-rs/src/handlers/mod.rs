@@ -6,3 +6,4 @@ pub(crate) mod index;
 pub(crate) mod library;
 pub(crate) mod not_found;
 pub(crate) mod setup;
+pub(crate) mod stream;

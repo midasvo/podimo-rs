@@ -81,6 +81,7 @@ async fn podcasts_to_rss_renders_expected_structure() {
         "nl-NL",
         false,
         None,
+        "http://proxy.test",
         &scraper,
         &head_cache,
     )
@@ -139,6 +140,7 @@ async fn podcasts_to_rss_appends_jpg_fragment_to_extensionless_image_urls() {
         "nl-NL",
         false,
         None,
+        "http://proxy.test",
         &scraper,
         &head_cache,
     )
@@ -172,6 +174,7 @@ async fn podcasts_to_rss_preserves_existing_jpg_extension() {
         "nl-NL",
         false,
         None,
+        "http://proxy.test",
         &scraper,
         &head_cache,
     )
@@ -195,6 +198,7 @@ async fn podcasts_to_rss_limits_to_n_newest_episodes() {
         "nl-NL",
         false,
         Some(1),
+        "http://proxy.test",
         &scraper,
         &head_cache,
     )
@@ -218,6 +222,7 @@ async fn podcasts_to_rss_limit_larger_than_episode_count_is_noop() {
         "nl-NL",
         false,
         Some(999),
+        "http://proxy.test",
         &scraper,
         &head_cache,
     )
@@ -238,6 +243,7 @@ async fn podcasts_to_rss_sets_itunes_block_when_public_feeds_disabled() {
         "nl-NL",
         /*public_feeds=*/ false,
         None,
+        "http://proxy.test",
         &scraper,
         &head_cache,
     )
@@ -254,6 +260,7 @@ async fn podcasts_to_rss_sets_itunes_block_when_public_feeds_disabled() {
         "nl-NL",
         /*public_feeds=*/ true,
         None,
+        "http://proxy.test",
         &scraper,
         &head_cache,
     )
@@ -372,4 +379,45 @@ async fn audiobook_to_rss_sets_itunes_block_when_public_feeds_disabled() {
     .await
     .expect("render");
     assert!(!rss_public.contains("itunes:block"));
+}
+
+#[tokio::test]
+async fn podcasts_to_rss_routes_hls_episodes_through_stream_proxy() {
+    // Empty head cache: an HLS episode must not trigger a HEAD probe, so this
+    // stays offline even though nothing is stubbed.
+    let head_cache: TtlCache<HeadInfo> =
+        TtlCache::new("head_hls_test", None, Duration::from_secs(60)).await;
+    let scraper = Client::new();
+
+    let mut payload = fixed_payload();
+    let episodes = payload["episodes"].as_array_mut().unwrap();
+    episodes.truncate(1);
+    episodes[0]["audio"] = serde_json::Value::Null;
+    episodes[0]["streamMedia"] = json!({
+        "url": "https://media-cdn-episodes.podimo.com/ep1/ep1.m3u8?u=x&KeyName=k&Signature=s",
+        "duration": 1234
+    });
+
+    let rss = podcasts_to_rss(
+        &payload,
+        "podcast-uuid",
+        "nl-NL",
+        false,
+        None,
+        "http://proxy.test",
+        &scraper,
+        &head_cache,
+    )
+    .await
+    .expect("render");
+
+    assert!(
+        rss.contains(
+            "url=\"http://proxy.test/stream/ep1.aac?src=https%3A%2F%2Fmedia-cdn-episodes.podimo.com%2Fep1%2Fep1.m3u8%3Fu%3Dx%26KeyName%3Dk%26Signature%3Ds\""
+        ),
+        "enclosure should point at the stream proxy: {rss}"
+    );
+    assert!(rss.contains("type=\"audio/aac\""), "{rss}");
+    assert!(!rss.contains("audio/x-mpegurl"), "{rss}");
+    assert!(rss.contains("<itunes:duration>1234</itunes:duration>"));
 }

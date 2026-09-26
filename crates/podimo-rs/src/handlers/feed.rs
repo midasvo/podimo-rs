@@ -65,12 +65,14 @@ async fn serve(
         Err(err) => return AppError::Internal(format!("fetch podcasts: {err}")).into_response(),
     };
 
+    let stream_base_url = format!("{}://{}", state.config.protocol, state.config.hostname);
     match crate::podimo::rss::podcasts_to_rss(
         &payload,
         podcast_id,
         &auth.locale,
         state.config.public_feeds,
         limit,
+        &stream_base_url,
         &state.scraper,
         &state.caches.head,
     )

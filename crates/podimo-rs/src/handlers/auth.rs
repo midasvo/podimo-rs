@@ -55,6 +55,8 @@ You need to login with the correct credentials for Podimo.\n\n\
 /// `content_kind_label` is plain English ("podcast" / "audiobook") and only
 /// appears in the 400 "Invalid X id format" error body. Order matches the
 /// pre-extraction handlers so external behaviour is identical.
+// The `Response` error is returned straight to axum, same as `library_or_404`.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn authorize_request(
     state: &AppState,
     params: &HashMap<String, String>,
