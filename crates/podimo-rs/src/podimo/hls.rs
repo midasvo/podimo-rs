@@ -5,9 +5,11 @@
 //! Podcatchers want a single progressive file, so we walk the
 //! highest-bandwidth variant, strip the TS/PES framing to get raw ADTS AAC,
 //! and pipe that through `ffmpeg` into the feed's [`StreamFormat`]: MP3
-//! (re-encoded) or M4A (the same AAC, repackaged). ffmpeg only ever sees
-//! stdin/stdout; all network I/O stays in here.
+//! (re-encoded, streamed as it's produced) or M4A (the same AAC, repackaged
+//! into a complete file). ffmpeg reads stdin and writes stdout or a local
+//! file; all network I/O stays in here.
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,9 +21,10 @@ use futures::{Stream, StreamExt};
 use once_cell::sync::Lazy;
 use reqwest::{Client, Url};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::ReaderStream;
 use tokio_util::task::AbortOnDropHandle;
@@ -53,7 +56,10 @@ static TRANSCODE_SLOTS: Lazy<Arc<Semaphore>> =
 const ALLOWED_HOST_SUFFIX: &str = ".podimo.com";
 
 /// Segments fetched ahead of the one currently being written to the client.
-const SEGMENT_PREFETCH: usize = 4;
+pub const SEGMENT_PREFETCH: usize = 4;
+/// Segments fetched at once while assembling a complete file, where nothing
+/// is sent until the last one is in.
+pub const PREPARE_PREFETCH: usize = 8;
 const SEGMENT_RETRIES: u32 = 3;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -84,10 +90,10 @@ pub enum HlsError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamFormat {
-    /// Re-encoded with LAME: plays everywhere, costs CPU.
+    /// Re-encoded with LAME ([`transcode_mp3`]): plays everywhere, costs CPU.
     Mp3,
-    /// Podimo's AAC untouched in a fragmented MP4: near-zero CPU, original
-    /// quality, and unlike raw ADTS the container carries the duration.
+    /// Podimo's AAC untouched in an MP4 ([`remux_m4a`]): near-zero CPU,
+    /// original quality, and an index players can seek with.
     M4a,
 }
 
@@ -116,44 +122,50 @@ impl StreamFormat {
             Self::M4a => "audio/x-m4a",
         }
     }
-
-    /// ffmpeg output options for ADTS AAC arriving on stdin.
-    fn ffmpeg_output_args(self) -> &'static [&'static str] {
-        match self {
-            // LAME at -q 7 costs ~40% less CPU than its default for no audible
-            // difference on speech. CBR keeps player duration estimates exact,
-            // since there's no Xing header on a pipe.
-            Self::Mp3 => &[
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "128k",
-                "-compression_level",
-                "7",
-                "-f",
-                "mp3",
-            ],
-            // Stream copy. Fragmented so it can be written to a pipe; ffprobe
-            // still reads the exact duration from the fragments.
-            Self::M4a => &[
-                "-c:a",
-                "copy",
-                "-bsf:a",
-                "aac_adtstoasc",
-                "-movflags",
-                "+empty_moov+default_base_moof",
-                "-frag_duration",
-                "10000000",
-                "-f",
-                "mp4",
-            ],
-        }
-    }
-
-    fn reencodes(self) -> bool {
-        matches!(self, Self::Mp3)
-    }
 }
+
+/// ffmpeg options for ADTS AAC on stdin, before the output options. `-y`
+/// replaces whatever an interrupted earlier attempt left at the output path.
+const FFMPEG_INPUT_ARGS: &[&str] = &[
+    "-hide_banner",
+    "-nostats",
+    "-loglevel",
+    "error",
+    "-y",
+    "-f",
+    "aac",
+    "-i",
+    "pipe:0",
+    "-map",
+    "0:a:0",
+];
+
+/// LAME at -q 7 costs ~40% less CPU than its default for no audible
+/// difference on speech. CBR keeps player duration estimates exact, since
+/// there's no Xing header on a pipe.
+const MP3_OUTPUT_ARGS: &[&str] = &[
+    "-c:a",
+    "libmp3lame",
+    "-b:a",
+    "128k",
+    "-compression_level",
+    "7",
+    "-f",
+    "mp3",
+];
+
+/// Stream copy into a regular MP4 with its index (`moov`) moved to the
+/// front, which takes a seekable output: a file, not a pipe.
+const M4A_OUTPUT_ARGS: &[&str] = &[
+    "-c:a",
+    "copy",
+    "-bsf:a",
+    "aac_adtstoasc",
+    "-movflags",
+    "+faststart",
+    "-f",
+    "mp4",
+];
 
 /// True when `url` points at an HLS playlist rather than a progressive file.
 pub fn is_hls_url(url: &str) -> bool {
@@ -210,6 +222,18 @@ fn check_podimo_https(url: &Url) -> Result<(), HlsError> {
         return Err(HlsError::InvalidSource("host not allowed"));
     }
     Ok(())
+}
+
+/// A file-name-safe key for the audio behind a validated `src`: its host and
+/// path, without the signature, which changes whenever Podimo re-signs the
+/// same playlist. Derived from the playlist rather than the episode ID in
+/// the request, so a request can't file one episode's audio under another's
+/// name.
+pub fn source_key(src: &Url) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(src.host_str().unwrap_or_default().as_bytes());
+    hasher.update(src.path().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Fetch the playlist at `src` and return the segment URLs of its
@@ -272,9 +296,9 @@ pub fn media_segments(text: &str, base: &Url) -> Result<Vec<Url>, HlsError> {
     Ok(segments)
 }
 
-/// Stream the concatenated ADTS AAC of `segments`, fetching a few ahead.
-/// An `Err` item aborts the response mid-body, so a client never mistakes a
-/// truncated episode for a complete one.
+/// Stream the concatenated ADTS AAC of `segments`, fetching `prefetch` at a
+/// time. An `Err` item aborts the response mid-body, so a client never
+/// mistakes a truncated episode for a complete one.
 ///
 /// Each fetch runs as its own task. A future inside `buffered` only makes
 /// progress while the stream is polled, and a slow or paused client can keep
@@ -285,13 +309,15 @@ pub fn media_segments(text: &str, base: &Url) -> Result<Vec<Url>, HlsError> {
 pub fn aac_stream(
     client: Client,
     segments: Vec<Url>,
+    prefetch: usize,
 ) -> impl Stream<Item = Result<Bytes, HlsError>> {
-    aac_stream_with_timeout(client, segments, FETCH_TIMEOUT)
+    aac_stream_with_timeout(client, segments, prefetch, FETCH_TIMEOUT)
 }
 
 fn aac_stream_with_timeout(
     client: Client,
     segments: Vec<Url>,
+    prefetch: usize,
     fetch_timeout: Duration,
 ) -> impl Stream<Item = Result<Bytes, HlsError>> {
     let mut demuxer = TsDemuxer::default();
@@ -302,7 +328,7 @@ fn aac_stream_with_timeout(
                 fetch_segment(&client, &url, fetch_timeout).await
             }))
         })
-        .buffered(SEGMENT_PREFETCH)
+        .buffered(prefetch)
         .map(move |joined| {
             let segment =
                 joined.map_err(|err| HlsError::Upstream(format!("segment task: {err}")))??;
@@ -312,58 +338,25 @@ fn aac_stream_with_timeout(
         })
 }
 
-/// Turn an ADTS AAC stream into `format` with ffmpeg, streaming the output
-/// as it's produced. First waits for a stream slot, and for MP3 also a
-/// transcode slot; [`HlsError::Busy`] if one doesn't free up in time. Both
-/// are held until the stream ends or is dropped.
+/// Re-encode an ADTS AAC stream to MP3 with ffmpeg, streaming the output as
+/// it's produced. First waits for a stream slot and a transcode slot;
+/// [`HlsError::Busy`] if one doesn't free up in time. Both are held until the
+/// stream ends or is dropped.
 ///
 /// Failures — upstream errors in `aac` as well as ffmpeg itself failing —
 /// arrive as a trailing `Err` item, so the response is cut short instead of
 /// ending in a truncated file that looks complete. Dropping the stream (the
 /// client went away) kills ffmpeg and stops the upstream fetch.
-pub async fn transcode<S>(
+pub async fn transcode_mp3<S>(
     aac: S,
-    format: StreamFormat,
 ) -> Result<impl Stream<Item = Result<Bytes, HlsError>>, HlsError>
 where
     S: Stream<Item = Result<Bytes, HlsError>> + Send + 'static,
 {
     let stream_slot = acquire_slot(&STREAM_SLOTS, SLOT_WAIT).await?;
-    let transcode_slot = if format.reencodes() {
-        Some(acquire_slot(&TRANSCODE_SLOTS, SLOT_WAIT).await?)
-    } else {
-        None
-    };
-
-    let mut child = Command::new(FFMPEG)
-        .args([
-            "-hide_banner",
-            "-nostats",
-            "-loglevel",
-            "error",
-            "-f",
-            "aac",
-            "-i",
-            "pipe:0",
-            "-map",
-            "0:a:0",
-        ])
-        .args(format.ffmpeg_output_args())
-        .arg("pipe:1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|err| HlsError::Transcode(format!("could not start {FFMPEG}: {err}")))?;
-    let stdin = child.stdin.take().expect("stdin is piped");
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-
-    let feeder = AbortOnDropHandle::new(tokio::spawn(feed_ffmpeg(aac, stdin)));
-    // Drained concurrently: a chatty ffmpeg would otherwise block on a full
-    // stderr pipe and stall the transcode.
-    let stderr_tail = AbortOnDropHandle::new(tokio::spawn(read_tail(stderr)));
+    let transcode_slot = acquire_slot(&TRANSCODE_SLOTS, SLOT_WAIT).await?;
+    let mut ffmpeg = Ffmpeg::spawn(aac, MP3_OUTPUT_ARGS, "pipe:1", Stdio::piped())?;
+    let stdout = ffmpeg.child.stdout.take().expect("stdout is piped");
 
     let output = ReaderStream::with_capacity(stdout, 64 * 1024).map(|chunk| {
         chunk.map_err(|err| HlsError::Transcode(format!("reading ffmpeg output: {err}")))
@@ -372,25 +365,94 @@ where
     // Polled once ffmpeg has closed stdout, i.e. when it's finished.
     let outcome = futures::stream::once(async move {
         let _slots = (stream_slot, transcode_slot);
-        let status = child
-            .wait()
-            .await
-            .map_err(|err| HlsError::Transcode(format!("waiting for ffmpeg: {err}")))?;
-        if !status.success() {
-            let stderr = stderr_tail.await.unwrap_or_default();
-            return Err(HlsError::Transcode(format!(
-                "ffmpeg exited with {status}: {stderr}"
-            )));
-        }
-        // A clean exit means ffmpeg saw EOF on stdin, so the feeder is done;
-        // this surfaces an upstream error that cut the input short.
-        feeder
-            .await
-            .map_err(|err| HlsError::Transcode(format!("feeding ffmpeg: {err}")))?
+        ffmpeg.finish().await
     })
     .filter_map(|outcome| async move { outcome.err().map(Err) });
 
     Ok(output.chain(outcome))
+}
+
+/// Repackage an ADTS AAC stream into an MP4 file at `dest`, index first.
+/// First waits for a stream slot; [`HlsError::Busy`] if one doesn't free up
+/// in time.
+///
+/// A complete file rather than a fragmented stream, because that's what
+/// players can seek in: ExoPlayer (AntennaPod and most Android podcast apps)
+/// treats a fragmented MP4 without a segment index as unseekable, so resuming
+/// or skipping ahead jumps back to the start. The index needs every sample,
+/// so nothing can be served before the whole episode is in.
+///
+/// On failure `dest` may hold a partial file, which is the caller's to
+/// remove.
+pub async fn remux_m4a<S>(aac: S, dest: &Path) -> Result<(), HlsError>
+where
+    S: Stream<Item = Result<Bytes, HlsError>> + Send + 'static,
+{
+    let _stream_slot = acquire_slot(&STREAM_SLOTS, SLOT_WAIT).await?;
+    Ffmpeg::spawn(aac, M4A_OUTPUT_ARGS, dest, Stdio::null())?
+        .finish()
+        .await
+}
+
+/// An ffmpeg process reading ADTS AAC on stdin, fed by a background task.
+struct Ffmpeg {
+    child: Child,
+    feeder: AbortOnDropHandle<Result<(), HlsError>>,
+    stderr_tail: AbortOnDropHandle<String>,
+}
+
+impl Ffmpeg {
+    fn spawn<S>(
+        aac: S,
+        output_args: &[&str],
+        output: impl AsRef<std::ffi::OsStr>,
+        stdout: Stdio,
+    ) -> Result<Self, HlsError>
+    where
+        S: Stream<Item = Result<Bytes, HlsError>> + Send + 'static,
+    {
+        let mut child = Command::new(FFMPEG)
+            .args(FFMPEG_INPUT_ARGS)
+            .args(output_args)
+            .arg(output)
+            .stdin(Stdio::piped())
+            .stdout(stdout)
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|err| HlsError::Transcode(format!("could not start {FFMPEG}: {err}")))?;
+        let stdin = child.stdin.take().expect("stdin is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let feeder = AbortOnDropHandle::new(tokio::spawn(feed_ffmpeg(aac, stdin)));
+        // Drained concurrently: a chatty ffmpeg would otherwise block on a
+        // full stderr pipe and stall.
+        let stderr_tail = AbortOnDropHandle::new(tokio::spawn(read_tail(stderr)));
+        Ok(Self {
+            child,
+            feeder,
+            stderr_tail,
+        })
+    }
+
+    /// Wait for ffmpeg to exit. Input cut short by an upstream error counts
+    /// as a failure too, although ffmpeg itself ends cleanly on that EOF.
+    async fn finish(mut self) -> Result<(), HlsError> {
+        let status = self
+            .child
+            .wait()
+            .await
+            .map_err(|err| HlsError::Transcode(format!("waiting for ffmpeg: {err}")))?;
+        if !status.success() {
+            let stderr = self.stderr_tail.await.unwrap_or_default();
+            return Err(HlsError::Transcode(format!(
+                "ffmpeg exited with {status}: {stderr}"
+            )));
+        }
+        // A clean exit means ffmpeg saw EOF on stdin, so the feeder is done.
+        self.feeder
+            .await
+            .map_err(|err| HlsError::Transcode(format!("feeding ffmpeg: {err}")))?
+    }
 }
 
 /// `body` holding a stream slot until it's dropped, for the legacy `.aac`
@@ -422,7 +484,7 @@ async fn acquire_slot(
     }
 }
 
-/// Log which ffmpeg will do the MP3 transcodes, or warn that there is none,
+/// Log which ffmpeg will convert episodes, or warn that there is none,
 /// so a missing binary shows up at startup instead of on the first download.
 pub async fn log_ffmpeg_status() {
     let result = Command::new(FFMPEG)
@@ -943,7 +1005,8 @@ mod tests {
             segments.push(Url::parse(&format!("{}{seg_path}", server.uri())).unwrap());
         }
 
-        let stream = aac_stream_with_timeout(Client::new(), segments, fetch_timeout);
+        let stream =
+            aac_stream_with_timeout(Client::new(), segments, SEGMENT_PREFETCH, fetch_timeout);
         let mut stream = std::pin::pin!(stream);
         let mut items = 0;
         while let Some(item) = stream.next().await {
@@ -1040,11 +1103,49 @@ mod tests {
         futures::stream::iter(chunks)
     }
 
+    /// The boxes in `data` as (type, body); enough for ffmpeg's small files.
+    fn boxes(data: &[u8]) -> Vec<(&[u8], &[u8])> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 8 <= data.len() {
+            let size = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            out.push((&data[pos + 4..pos + 8], &data[pos + 8..pos + size]));
+            pos += size;
+        }
+        out
+    }
+
+    /// The descriptor that follows DecoderConfigDescriptor's fixed fields in
+    /// an `esds` body, as (tag, payload). ExoPlayer takes it as the
+    /// AudioSpecificConfig without checking the tag.
+    fn esds_decoder_specific_info(esds: &[u8]) -> (u8, &[u8]) {
+        fn header(d: &mut &[u8]) -> (u8, usize) {
+            let tag = d[0];
+            let mut size = 0;
+            let mut i = 1;
+            loop {
+                size = (size << 7) | usize::from(d[i] & 0x7F);
+                i += 1;
+                if d[i - 1] & 0x80 == 0 {
+                    break;
+                }
+            }
+            *d = &d[i..];
+            (tag, size)
+        }
+        let mut d = &esds[4..]; // version and flags
+        assert_eq!(header(&mut d).0, 0x03, "ES_Descriptor");
+        assert_eq!(d[2], 0, "no optional ES_Descriptor fields");
+        d = &d[3..];
+        assert_eq!(header(&mut d).0, 0x04, "DecoderConfigDescriptor");
+        d = &d[13..];
+        let (tag, size) = header(&mut d);
+        (tag, &d[..size])
+    }
+
     #[tokio::test]
     async fn transcode_mp3_is_128k_cbr() {
-        let stream = transcode(chunked(&adts_tone(4)), StreamFormat::Mp3)
-            .await
-            .unwrap();
+        let stream = transcode_mp3(chunked(&adts_tone(4))).await.unwrap();
         let (mp3, err) = collect(stream).await;
         assert!(err.is_none(), "{err:?}");
 
@@ -1061,20 +1162,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcode_m4a_keeps_the_aac_and_carries_the_duration() {
+    async fn remux_m4a_writes_a_seekable_mp4_that_keeps_the_aac() {
         let aac = adts_tone(4);
-        let stream = transcode(chunked(&aac), StreamFormat::M4a).await.unwrap();
-        let (m4a, err) = collect(stream).await;
-        assert!(err.is_none(), "{err:?}");
-        assert_eq!(&m4a[4..8], b"ftyp", "MP4 starts with its file type box");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("episode.m4a");
+        remux_m4a(chunked(&aac), &path).await.unwrap();
+        let m4a = std::fs::read(&path).unwrap();
+
+        // One index up front, then the audio: no fragments, which ExoPlayer
+        // can't seek in without a segment index.
+        let types: Vec<&[u8]> = boxes(&m4a).iter().map(|(t, _)| *t).collect();
+        assert_eq!(types.first(), Some(&&b"ftyp"[..]), "{types:?}");
+        let moov_at = types.iter().position(|t| t == b"moov");
+        let mdat_at = types.iter().position(|t| t == b"mdat");
+        assert!(
+            moov_at.is_some() && moov_at < mdat_at,
+            "moov first: {types:?}"
+        );
+        assert!(!types.contains(&&b"moof"[..]), "not fragmented: {types:?}");
+
+        // The AudioSpecificConfig must be there: without it ExoPlayer reads
+        // the next descriptor as one and fails ("length=1; index=1").
+        let (_, moov) = boxes(&m4a).into_iter().find(|(t, _)| t == b"moov").unwrap();
+        let at = moov.windows(4).position(|w| w == b"esds").unwrap();
+        let size = u32::from_be_bytes(moov[at - 4..at].try_into().unwrap()) as usize;
+        let (tag, asc) = esds_decoder_specific_info(&moov[at + 4..at - 4 + size]);
+        assert_eq!(tag, 0x05, "DecoderSpecificInfo");
+        assert_eq!(asc[0] >> 3, 2, "AAC LC");
+        assert_eq!(((asc[0] & 0x07) << 1) | (asc[1] >> 7), 4, "44.1 kHz");
+        assert_eq!((asc[1] >> 3) & 0x0F, 1, "mono");
+
         // Repackaged, not re-encoded: the same AAC payload plus container.
         let ratio = m4a.len() as f64 / aac.len() as f64;
         assert!((0.9..1.2).contains(&ratio), "size ratio {ratio}");
 
-        // What raw ADTS couldn't give Audiobookshelf: a readable duration.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("episode.m4a");
-        std::fs::write(&path, &m4a).unwrap();
         let out = std::process::Command::new("ffprobe")
             .args(["-v", "error", "-show_entries", "format=duration"])
             .args(["-of", "csv=p=0"])
@@ -1086,34 +1207,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcode_ends_in_the_upstream_error() {
-        let aac = adts_tone(2);
-        for format in [StreamFormat::Mp3, StreamFormat::M4a] {
-            let input = futures::stream::iter(vec![
-                Ok(Bytes::copy_from_slice(adts_prefix(&aac, 40))),
-                Err(HlsError::Upstream("segment gone".into())),
-            ]);
-            let (out, err) = collect(transcode(input, format).await.unwrap()).await;
-            assert!(
-                matches!(err, Some(HlsError::Upstream(_))),
-                "{format:?}: {err:?}"
-            );
-            assert!(
-                !out.is_empty(),
-                "{format:?}: audio before the failure still streams"
-            );
-        }
+    async fn remux_m4a_overwrites_what_a_failed_attempt_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("episode.m4a");
+        std::fs::write(&path, b"leftover").unwrap();
+        remux_m4a(chunked(&adts_tone(1)), &path).await.unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap()[4..8], b"ftyp");
+    }
+
+    fn cut_short(aac: &[u8]) -> impl Stream<Item = Result<Bytes, HlsError>> {
+        futures::stream::iter(vec![
+            Ok(Bytes::copy_from_slice(adts_prefix(aac, 40))),
+            Err(HlsError::Upstream("segment gone".into())),
+        ])
     }
 
     #[tokio::test]
-    async fn transcode_reports_ffmpeg_failure() {
-        for format in [StreamFormat::Mp3, StreamFormat::M4a] {
-            let input = futures::stream::iter(vec![Ok(Bytes::from_static(&[0x42; 4096]))]);
-            let (_, err) = collect(transcode(input, format).await.unwrap()).await;
-            assert!(
-                matches!(err, Some(HlsError::Transcode(_))),
-                "{format:?}: {err:?}"
-            );
-        }
+    async fn transcode_mp3_ends_in_the_upstream_error() {
+        let aac = adts_tone(2);
+        let (out, err) = collect(transcode_mp3(cut_short(&aac)).await.unwrap()).await;
+        assert!(matches!(err, Some(HlsError::Upstream(_))), "{err:?}");
+        assert!(!out.is_empty(), "audio before the failure still streams");
+    }
+
+    #[tokio::test]
+    async fn remux_m4a_fails_on_an_upstream_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("episode.m4a");
+        let err = remux_m4a(cut_short(&adts_tone(2)), &path).await;
+        assert!(matches!(err, Err(HlsError::Upstream(_))), "{err:?}");
+    }
+
+    fn garbage() -> impl Stream<Item = Result<Bytes, HlsError>> {
+        futures::stream::iter(vec![Ok(Bytes::from_static(&[0x42; 4096]))])
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_failures_are_reported() {
+        let (_, err) = collect(transcode_mp3(garbage()).await.unwrap()).await;
+        assert!(matches!(err, Some(HlsError::Transcode(_))), "mp3: {err:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = remux_m4a(garbage(), &dir.path().join("episode.m4a")).await;
+        assert!(matches!(err, Err(HlsError::Transcode(_))), "m4a: {err:?}");
+    }
+
+    #[test]
+    fn source_key_ignores_the_signature() {
+        let signed = |sig: &str| {
+            Url::parse(&format!(
+                "https://media-cdn-episodes.podimo.com/a/a.m3u8?KeyName=k&Signature={sig}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(source_key(&signed("one")), source_key(&signed("two")));
+        let other = Url::parse("https://media-cdn-episodes.podimo.com/b/b.m3u8").unwrap();
+        assert_ne!(source_key(&signed("one")), source_key(&other));
+        assert!(source_key(&other).chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

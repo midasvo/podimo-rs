@@ -5,6 +5,7 @@
 pub(crate) mod blocklist;
 pub mod cache;
 pub mod config;
+pub(crate) mod episode_files;
 pub(crate) mod error;
 pub(crate) mod handlers;
 pub mod library;

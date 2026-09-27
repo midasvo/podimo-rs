@@ -8,6 +8,7 @@ use reqwest::Client;
 use crate::blocklist::BlockList;
 use crate::cache::Caches;
 use crate::config::Config;
+use crate::episode_files::EpisodeFiles;
 use crate::library::Library;
 use crate::templates::Templates;
 
@@ -20,6 +21,8 @@ pub struct AppState {
     pub(crate) blocklist: Arc<BlockList>,
     pub(crate) scraper: Client,
     pub(crate) templates: Templates,
+    /// Finished M4A episodes, served from disk (see `episode_files`).
+    pub(crate) episode_files: EpisodeFiles,
     /// `Some` when `ENABLE_LIBRARY=true`; handlers under `/library/*` reject
     /// requests with 404 when this is `None`. Public so integration tests can
     /// seed entries directly without driving the HTTP `/library/add` flow.
@@ -67,12 +70,20 @@ impl AppState {
             None
         };
 
+        let episode_files = EpisodeFiles::new()?;
+        tracing::debug!(
+            target: "podimo",
+            "episode files in {}",
+            episode_files.dir().display()
+        );
+
         Ok(Self {
             config: Arc::new(config),
             caches,
             blocklist,
             scraper,
             templates: Templates::new(),
+            episode_files,
             library,
         })
     }

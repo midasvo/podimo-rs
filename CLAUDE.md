@@ -1,81 +1,77 @@
-# CLAUDE.md
+# podimo-rs
 
-Guidance for Claude Code in this repository.
+An unofficial podcast and audiobook proxy for Podimo, written in Rust. It serves
+two things:
 
-## What this is
+1. **RSS feeds** (`/feed/<podcast-id>.xml`, `/audiobook/<audiobook-id>.xml`):
+   standard feeds for podcatchers and Audiobookshelf.
+2. **Audiobook sync to disk** (`/library`): saves subscribed audiobooks to
+   `LIBRARY_DIR/<Author>/<Title>/` so Audiobookshelf can serve them.
 
-Self-hosted proxy that serves Podimo shows and audiobooks as RSS feeds. Rust:
-axum on tokio, reqwest (rustls), moka caches, minijinja templates, the
-`rss` crate. One binary, `podimo-rs`, on port 12104. Podimo delivers episode
-audio as HLS; ffmpeg (must be on `PATH`) turns it into one file per episode.
+## Development commands
 
-## Commands
-
-```sh
-cp .env.example .env
-cargo run --bin podimo-rs
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all --locked    # the transcode tests need ffmpeg and ffprobe
+```bash
+cargo build                      # build
+cargo test                       # all tests (needs ffmpeg on PATH)
+cargo clippy --all-targets       # linter (-D warnings)
+cargo fmt --all -- --check       # style check
+cargo run                        # run locally (reads .env)
 ```
 
-CI runs these on PRs and `main`. Pushes to `main` publish
-`ghcr.io/midasvo/podimo-rs:latest`; `vX.Y.Z` tags publish versioned images
-(bump `crates/podimo-rs/Cargo.toml` to match first).
+Running a single test:
 
-Renovate (`.github/renovate.json5`, checked by `renovate-config.yml`) runs
-`cargo update` early on Mondays and merges that PR itself once CI passes, so
-`:latest` picks up compatible crate releases weekly. Versions outside a
-`Cargo.toml` range are breaking and get their own PR, merged by hand, as do
-Docker and GitHub Actions updates.
-
-## Routes
-
-| Route | Handler |
-| --- | --- |
-| `GET /feed/<podcast_id>.xml[?limit=N]` | `handlers/feed.rs` |
-| `GET /audiobook/<audiobook_id>.xml` | `handlers/audiobook.rs` |
-| `GET /stream/<token>/<episode_id>.m4a` or `.mp3` | `handlers/stream.rs` |
-| `GET /stream/<episode_id>.aac?src=…` (legacy, kept for stored URLs) | `handlers/stream.rs` |
-| `GET, POST /` (form that builds feed URLs) | `handlers/index.rs` |
-| `/library/*`, `/setup` (opt-in audiobook library) | `handlers/library.rs`, `handlers/setup.rs` |
-| `GET /healthz` | `handlers/healthz.rs` |
-
-`middleware.rs` adds CORS to GET/HEAD on `/feed`, `/audiobook` and `/stream`,
-and `Cache-Control` (`max-age=900` on 2xx, `no-store` otherwise and on
-`/healthz`).
-
-## Layout
-
+```bash
+cargo test -p podimo-rs test_name
+cargo test -p podimo-rs --test integration_feed
 ```
+
+The transcode tests in `crates/podimo-rs/src/podimo/hls.rs` invoke the real
+`ffmpeg` binary (via lavfi sine tone generation and ffprobe). CI runs with
+Debian's `ffmpeg` installed.
+
+## Architecture
+
+A cargo workspace with one binary crate:
+
+```text
 crates/podimo-rs/src/
-  main.rs, lib.rs     entrypoint; `app()` builds the router
-  config.rs           env + .env loading
-  state.rs            AppState: config, caches, block list, HTTP client, templates
-  handlers/           one file per route group; auth.rs is the shared credential gate
-  podimo/client.rs    GraphQL login and queries
-  podimo/rss.rs       feed rendering
-  podimo/hls.rs       playlist parsing, TS → ADTS demux, ffmpeg transcode
-  podimo/head.rs      HEAD probe for the size of non-HLS enclosures
+  main.rs             entry point, router assembly, tracing init
+  config.rs           env-var parsing with serde / envy
+  state.rs            AppState: caches, clients, config
+  handlers/           axum request handlers
+    feed.rs           /feed, /audiobook, /
+    stream.rs         /stream/<token>/<id>.mp3|.m4a, /stream/<id>.aac
+    library.rs        /library (web UI and JSON API)
+    setup.rs          /setup form
+  podimo/             upstream Podimo GraphQL and auth
+    client.rs         GraphQL queries and token refresh
+    auth.rs           token parsing and cookies
+    hls.rs            HLS playlist resolution, MPEG-TS demux, ffmpeg transcode
+    head.rs           HEAD probe for the size of non-HLS enclosures
   library/            audiobook downloads and on-disk layout
   cache.rs            TtlCache: moka in memory, JSON files on disk
+  episode_files.rs    finished M4A episodes in a temp dir, one preparation per episode
   util.rs             helpers: auth parsing, request_base_url, amp_arg, …
 crates/podimo-rs/templates/   HTML, embedded with include_str!
 crates/podimo-rs/tests/       integration tests; Podimo is mocked with wiremock
 ```
 
-## Feed flow
+## Podimo auth flow
 
-1. `auth::authorize_request` gets credentials: HTTP Basic with username
-   `email,region,locale` by default, or `PODIMO_EMAIL`/`PODIMO_PASSWORD` plus
-   `?region=&locale=` when `LOCAL_CREDENTIALS=true`. Region and locale default
-   to `nl` and `nl-NL`. It also validates the ID and checks the block list
-   (a listed token anywhere in the percent-decoded URL, in any case, gives
-   `410`). `/stream` checks it too, against the episode id and playlist URL.
-2. `PodimoClient::login` does three GraphQL calls; the token is cached under
-   `sha256(user~pass)`. `get_podcasts` pages episodes 100 at a time and
-   `?limit` stops after the pages it needs. The listing is cached per account
-   (that hash) and show: `p<n>` for the first `n` pages, shared by every limit
+- **Web login**: `POST https://auth.podimo.com/tokens` returns access and
+  refresh tokens.
+- **App login**: `POST https://auth.podimo.com/apple/tokens` or `/google/tokens`.
+- Stored as `PODIMO_ACCESS_TOKEN` / `PODIMO_REFRESH_TOKEN` in `.env` or passed
+  via HTTP Basic auth per request.
+- The GraphQL endpoint is `https://api.podimo.com/graphql`. Queries are plain
+  strings in `crates/podimo-rs/src/podimo/client.rs`.
+
+## Feed generation
+
+1. `handlers::feed::get_podcast_feed` parses the podcast ID from the route.
+2. It fetches episodes via `client::episodes` with pagination.
+   The memory cache key includes `?limit=N` when the caller asked for fewer
+   episodes than the default 100, so a small request doesn't evict the entry
    in that hundred, or `all` once the show ran out, which serves any limit.
    The audiobook caches are per account too, since payloads hold signed URLs.
 3. `rss::podcasts_to_rss` renders the feed. HLS episodes link to `/stream`
@@ -98,28 +94,42 @@ of ~10 s MPEG-TS segments with AAC-LC. There is no progressive file upstream.
 - `/stream` has no auth, since the signed URL is the credential, but only
   accepts https `.m3u8` URLs on `*.podimo.com`. The variant and segment URLs
   in the playlists, and any redirect target, must be https on `*.podimo.com`
-  too. It takes the highest-bandwidth variant, fetches segments 4 ahead with
-  retries, demuxes TS to ADTS and pipes that through ffmpeg over
-  stdin/stdout.
-- At most 16 `/stream` bodies run at once, of any format, and at most 4 of
-  them are MP3 encodes. A request that doesn't get a slot within 10 s gets 503
-  with `Retry-After: 30`. HEAD takes no slot.
+  too. It takes the highest-bandwidth variant, fetches segments with retries,
+  demuxes TS to ADTS and pipes that into ffmpeg's stdin.
+- At most 16 `/stream` bodies or file preparations run at once, of any format,
+  and at most 4 of them are MP3 encodes. A request that doesn't get a slot
+  within 10 s gets 503 with `Retry-After: 30`. HEAD takes no slot.
 - `STREAM_FORMAT` (`hls::StreamFormat`) sets what feeds link to; both
   extensions are always served.
-  - `m4a` (default): stream copy into fragmented MP4. Almost no CPU, original
-    quality, and ffprobe reads the exact duration.
-  - `mp3`: LAME, 128 kbps CBR at `-q 7`. About one core per download. CBR
-    keeps the duration right without a Xing header.
-- A failure mid-stream ends the chunked body with an error rather than a short
-  file that looks complete. A client disconnect kills ffmpeg. HEAD skips
-  ffmpeg. `Range` is ignored.
+  - `m4a` (default): stream copy into a regular MP4 with the `moov` up front
+    (`hls::remux_m4a`). Almost no CPU, original quality. The whole episode is
+    fetched (8 segments at a time, ~2 s for 45 min) before the response
+    starts; `episode_files.rs` keeps the file in a temp dir for an hour after
+    its last request (2 GB at most, LRU) and serves it with `ServeFile`, so
+    there's a `Content-Length` and `Range` works. Concurrent requests for an
+    episode share one preparation, which also survives the client leaving.
+    Keyed by `hls::source_key` (playlist host and path), not the episode ID
+    in the URL.
+  - `mp3`: LAME, 128 kbps CBR at `-q 7`, streamed from ffmpeg's stdout as
+    it's produced (4 segments ahead). About one core per download, at most 4
+    at once. CBR keeps the duration right without a Xing header. A failure
+    mid-stream ends the chunked body with an error rather than a short file
+    that looks complete; a client disconnect kills ffmpeg; `Range` is
+    ignored.
+- Why not a fragmented MP4 streamed straight from ffmpeg: ExoPlayer
+  (AntennaPod, most Android podcast apps) can't seek in one without a `sidx`,
+  which also needs the whole episode. And with `empty_moov` ffmpeg writes the
+  `moov` before the ADTS→ASC filter has seen a frame, leaving the `esds`
+  without an AudioSpecificConfig, which ExoPlayer fails on.
+- HEAD never fetches a whole episode: it only checks the playlist, unless the
+  M4A is ready already.
 
 ## Audiobooks and library
 
 - `/audiobook/<id>.xml` uses `audiobookById` for metadata and
   `audiobookAudioById` for the signed audio URL (cached for
   `AUDIOBOOK_AUDIO_CACHE_TIME`, 10 min by default).
-- The library (`ENABLE_LIBRARY=true`, requires `LOCAL_CREDENTIALS=true`)
+- The library (`ENABLE_LIBRARY=true`, requires `LOCAL_CREDENTIALS=true`)\
   downloads books to `LIBRARY_DIR/<Author>/<Title>/` in Audiobookshelf's
   layout: `<Title>.mp3`, `cover.jpg`, `metadata.json`, plus our
   `podimo-state.json`. Downloads interrupted by a restart come back as failed.
@@ -132,32 +142,12 @@ of ~10 s MPEG-TS segments with AAC-LC. There is no progressive file upstream.
 `<CACHE_DIR>/<name>/<key>.json`, loaded lazily on first read. Expired entries
 stay on disk: `get` skips them, `get_stale` returns them too. `url_head_info`
 caches only 2xx answers. It retries a 5xx like a timeout or connection error,
-but not another error status. When the probe fails it returns the expired
-`head` entry, since a stale size beats a failed probe. Without one, an error
-status gives length `0` (not cached) and no answer at all an error.
-`STORE_TOKENS_ON_DISK=false` keeps tokens in memory only.
-Startup deletes the bincode files that 1.2.0 and earlier left in
-`<CACHE_DIR>/*_cache/`.
+and falls back to an expired size when every attempt fails.
 
-## Gotchas
+## Code style
 
-- `util::amp_arg` also accepts `amp;region`/`amp;locale`: some clients,
-  Audiobookshelf among them, don't decode `&amp;` in feed URLs.
-- Image URLs get a `#.jpg` fragment because Podimo's signed image URLs have no
-  extension and some podcatchers require one.
-- Podimo's API is behind Cloudflare, which blocks most data center IPs.
-  `SCRAPER_API`, `ZENROWS_API` and `HTTP_PROXY` are checked in that order.
-  Errors from `post_graphql` name only the host, never the proxy URL with its
-  key.
-- Logs are `LEVEL | timestamp | message`. `RUST_LOG` sets the level and
-  `PODIMO_LOG_JSON=true` switches to JSON.
-- Newer clippy flags `Result<_, Response>` as `result_large_err`. Handlers
-  allow it locally because the error goes straight back to axum.
-- The disk mirror must stay JSON or another self-describing format:
-  `serde_json::Value` (in `podcasts` and `audiobook_meta`) can't be read back
-  from bincode or postcard, and a failed read looks like a cache miss.
-
-## Known gaps
-
-- Audiobook chapters: `audiobookAudioById` returns one file without chapters.
-- The HTTP client shares one cookie jar across all users.
+- Formatting: `cargo fmt` with default settings (2024 edition style).
+- Error handling: `thiserror` for library-internal errors, `AppError` in
+  `error.rs` for axum responses. Never panic on user input.
+- Async runtime: `tokio` with `axum 0.8`.
+- HTTP client: `reqwest 0.13` with `rustls`.

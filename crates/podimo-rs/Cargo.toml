@@ -18,7 +18,7 @@ path = "src/lib.rs"
 # Web
 axum = { version = "0.8", features = ["macros", "tokio", "http1", "query", "form"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["trace"] }
+tower-http = { version = "0.7", features = ["fs", "trace"] }
 http = "1"
 http-body-util = "0.1"
 
@@ -42,7 +42,7 @@ rss = { version = "2", features = ["validation"] }
 quick-xml = "0.42"
 
 # Caching
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 # Config
 dotenvy = "0.15"
@@ -63,11 +63,11 @@ base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 mime_guess = "2"
 once_cell = "1"
+tempfile = "3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
-tempfile = "3"
 wiremock = "0.6"
 
 [lints]
