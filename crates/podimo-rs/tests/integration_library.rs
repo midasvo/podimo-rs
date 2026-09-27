@@ -1,7 +1,7 @@
 //! HTTP-level tests for the audiobook library. Library is single-user, so all
 //! tests boot with `LOCAL_CREDENTIALS=true` + `ENABLE_LIBRARY=true`. The book
-//! list is seeded directly via `AppState.library` to keep the tests offline —
-//! no Podimo upstream is exercised here.
+//! list is seeded directly via `AppState.library` to keep the tests offline;
+//! the few that need Podimo's API get a wiremock stand-in.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -9,6 +9,7 @@ use std::time::Duration;
 use podimo_rs::library::{LibraryEntry, Status};
 use podimo_rs::{app, config::Config, AppState};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -678,5 +679,51 @@ async fn retry_button_shown_only_for_failed_entries() {
         !body.contains(&format!("/library/{done_id}/retry")),
         "retry form should not appear for a done entry: {body}"
     );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn add_drops_a_cached_token_upstream_rejects() {
+    // Upstream rejects every query, as it would a revoked token. The cached
+    // token must go, so the next attempt logs in again instead of failing
+    // until the token's TTL runs out.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": [{ "message": "Unauthorized" }]
+        })))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let config = make_test_config_with_graphql_url(dir, format!("{}/graphql", server.uri()));
+    let (addr, handle, state) = boot_with_config(config).await;
+    // What `util::token_key` computes for the configured a@b.com / pw.
+    let key = hex::encode(Sha256::digest(b"a@b.com~pw"));
+    state
+        .caches
+        .tokens
+        .insert(key.clone(), "stale-token".into())
+        .await;
+
+    let resp = http_client()
+        .post(format!("http://{addr}/library/add"))
+        .form(&[(
+            "url_or_id",
+            "https://open.podimo.com/audiobook/fefa939e-c84d-4c16-8bbf-9575e1379d81",
+        )])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("fetch audiobook metadata"));
+    assert_eq!(state.caches.tokens.get(&key).await, None);
+    assert!(state.library.as_ref().unwrap().list().await.is_empty());
     handle.abort();
 }

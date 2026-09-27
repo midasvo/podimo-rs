@@ -13,6 +13,7 @@ use base64::Engine;
 use podimo_rs::cache::HeadInfo;
 use podimo_rs::{app, config::Config, AppState};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -627,5 +628,119 @@ async fn upstream_5xx_during_auth_returns_503() {
     assert_eq!(resp.status(), 503);
     let body = resp.text().await.unwrap();
     assert!(body.contains("Upstream"), "body: {body}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn wrong_password_returns_401() {
+    // Podimo answers a wrong email or password with a GraphQL error on the
+    // login query. That must ask for new credentials, not say "retry later".
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let query = body["query"].as_str().unwrap_or("");
+            if query.contains("AuthorizationAuthorize") {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "errors": [{ "message": "Invalid credentials" }],
+                    "data": null
+                }));
+            }
+            login_response(&body).unwrap_or_else(|| ResponseTemplate::new(500))
+        })
+        .mount(&server)
+        .await;
+    let state = AppState::new(make_config(format!("{}/graphql", server.uri())))
+        .await
+        .unwrap();
+    let (addr, handle) = boot_with_state(state).await;
+
+    for route in ["feed", "audiobook"] {
+        let resp = http_client()
+            .get(format!("http://{addr}/{route}/{PODCAST_ID}.xml"))
+            .header("Authorization", basic_auth("a@b.com,nl,nl-NL", "wrong"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "{route}");
+        assert!(resp.headers().contains_key("www-authenticate"), "{route}");
+    }
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_cached_token_upstream_rejects_is_dropped() {
+    // Only `fresh-token` works upstream; the cache starts out holding one
+    // Podimo no longer accepts.
+    let server = MockServer::start().await;
+    let logins = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&logins);
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let query = body["query"].as_str().unwrap_or("");
+            if query.contains("AuthorizationAuthorize") {
+                counter.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "tokenWithCredentials": { "token": "fresh-token" } }
+                }));
+            }
+            if let Some(resp) = login_response(&body) {
+                return resp;
+            }
+            let token = req
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok());
+            if token == Some("fresh-token") {
+                ResponseTemplate::new(200).set_body_json(fake_episodes_payload())
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "errors": [{ "message": "Unauthorized" }]
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let state = AppState::new(make_config(format!("{}/graphql", server.uri())))
+        .await
+        .unwrap();
+    // What `util::token_key` computes for a@b.com / pw.
+    let key = hex::encode(Sha256::digest(b"a@b.com~pw"));
+    state
+        .caches
+        .tokens
+        .insert(key.clone(), "stale-token".into())
+        .await;
+    state
+        .caches
+        .head
+        .insert(
+            "ep1".to_string(),
+            HeadInfo {
+                content_length: "9876".into(),
+                content_type: "audio/mpeg".into(),
+            },
+        )
+        .await;
+    let (addr, handle) = boot_with_state(state.clone()).await;
+    let feed = || {
+        http_client()
+            .get(format!("http://{addr}/feed/{PODCAST_ID}.xml"))
+            .header("Authorization", basic_auth("a@b.com,nl,nl-NL", "pw"))
+            .send()
+    };
+
+    assert_eq!(feed().await.unwrap().status(), 500, "the stale token fails");
+    assert_eq!(state.caches.tokens.get(&key).await, None, "and is dropped");
+    assert_eq!(
+        feed().await.unwrap().status(),
+        200,
+        "so the next one logs in"
+    );
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
     handle.abort();
 }

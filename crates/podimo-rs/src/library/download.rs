@@ -87,10 +87,20 @@ async fn perform(
         return Err("entry vanished mid-download".into());
     }
 
-    let audio_url = podimo
+    let audio_url = match podimo
         .get_audiobook_audio_url(scraper, config, audiobook_id, &caches.audiobook_audio)
         .await
-        .map_err(|e| format!("fetch audio url: {e}"))?;
+    {
+        Ok(url) => url,
+        Err(err) => {
+            // The token may be a cached one upstream has revoked since: drop
+            // it so the next attempt logs in again.
+            if !err.is_not_found() {
+                caches.tokens.remove(&podimo.key).await;
+            }
+            return Err(format!("fetch audio url: {err}"));
+        }
+    };
 
     // Cover is best-effort — a failed cover should not kill the audio download.
     if let Some(url) = cover_url {

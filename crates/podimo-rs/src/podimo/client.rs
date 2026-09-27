@@ -113,7 +113,13 @@ impl PodimoClient {
             "locale": self.locale,
             "preregisterId": self.prereg_id,
         });
-        let result = post_graphql(scraper, config, &headers, query, &variables).await?;
+        let result = post_graphql(scraper, config, &headers, query, &variables)
+            .await
+            .map_err(|err| match err {
+                // Podimo answers a wrong email or password with a GraphQL error here.
+                ClientError::GraphQl(msg) => ClientError::InvalidCredentials(msg),
+                other => other,
+            })?;
         let token = get_str(&result, &["tokenWithCredentials", "token"])
             .ok_or_else(|| ClientError::InvalidCredentials("no token in response".into()))?
             .to_string();

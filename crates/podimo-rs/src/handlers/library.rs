@@ -26,6 +26,7 @@ use serde_json::Value;
 use tokio_util::io::ReaderStream;
 
 use crate::error::AppError;
+use crate::handlers::auth::Authorized;
 use crate::library::{download, Library, LibraryEntry, Status};
 use crate::podimo::PodimoClient;
 use crate::state::AppState;
@@ -211,15 +212,15 @@ async fn handle_add(State(state): State<AppState>, Form(form): Form<AddForm>) ->
         return render_index_with_error(&state, "Invalid audiobook id format.").await;
     }
 
-    let client = match library_client(&state).await {
-        Ok(c) => c,
+    let auth = match library_client(&state).await {
+        Ok(a) => a,
         Err(err) => return render_index_with_error(&state, &err).await,
     };
 
     // Fetch metadata synchronously so we can populate the library row before
     // kicking off the (potentially long) audio download. Bail early on a bad
     // id rather than persisting an empty entry.
-    let meta = match fetch_audiobook_meta(&state, &client, &audiobook_id).await {
+    let meta = match fetch_audiobook_meta(&state, &auth, &audiobook_id).await {
         Ok(v) => v,
         Err(err) => return render_index_with_error(&state, &err).await,
     };
@@ -248,7 +249,7 @@ async fn handle_add(State(state): State<AppState>, Form(form): Form<AddForm>) ->
     tokio::spawn(async move {
         download::run(
             library_clone,
-            client,
+            auth.client,
             scraper_clone,
             config_clone,
             caches_clone,
@@ -265,7 +266,7 @@ async fn handle_add(State(state): State<AppState>, Form(form): Form<AddForm>) ->
 /// credentials (`PODIMO_EMAIL` / `PODIMO_PASSWORD`), reusing a cached token
 /// when we have one. Shared by `handle_add` and `handle_retry`; the error is
 /// the message to show on the page.
-async fn library_client(state: &AppState) -> Result<PodimoClient, String> {
+async fn library_client(state: &AppState) -> Result<Authorized, String> {
     let email = state
         .config
         .podimo_email
@@ -282,7 +283,9 @@ async fn library_client(state: &AppState) -> Result<PodimoClient, String> {
     let mut client = PodimoClient::new(email, password, region, locale)
         .map_err(|err| format!("Credentials invalid: {err}"))?;
 
-    if let Some(token) = state.caches.tokens.get(&client.key).await {
+    let cached_token = state.caches.tokens.get(&client.key).await;
+    let token_from_cache = cached_token.is_some();
+    if let Some(token) = cached_token {
         client.token = Some(token);
     } else {
         match client.login(&state.scraper, &state.config).await {
@@ -290,7 +293,11 @@ async fn library_client(state: &AppState) -> Result<PodimoClient, String> {
             Err(err) => return Err(format!("Login failed: {err}")),
         }
     }
-    Ok(client)
+    Ok(Authorized {
+        client,
+        locale: locale.to_string(),
+        token_from_cache,
+    })
 }
 
 /// Fetch `audiobookById` metadata for `audiobook_id`, translating client
@@ -298,24 +305,26 @@ async fn library_client(state: &AppState) -> Result<PodimoClient, String> {
 /// Shared by `handle_add` and `handle_retry`.
 async fn fetch_audiobook_meta(
     state: &AppState,
-    client: &PodimoClient,
+    auth: &Authorized,
     audiobook_id: &str,
 ) -> Result<Arc<Value>, String> {
-    client
+    let result = auth
+        .client
         .get_audiobook(
             &state.scraper,
             &state.config,
             audiobook_id,
             &state.caches.audiobook_meta,
         )
-        .await
-        .map_err(|err| {
-            if err.is_not_found() {
-                "Audiobook not found upstream.".to_string()
-            } else {
-                format!("Couldn't fetch audiobook metadata: {err}")
-            }
-        })
+        .await;
+    match result {
+        Ok(meta) => Ok(meta),
+        Err(err) if err.is_not_found() => Err("Audiobook not found upstream.".to_string()),
+        Err(err) => {
+            auth.forget_token_after(state, &err).await;
+            Err(format!("Couldn't fetch audiobook metadata: {err}"))
+        }
+    }
 }
 
 /// Pull `audiobookById.coverImage.url` out of a metadata payload. The signed
@@ -346,11 +355,11 @@ async fn handle_retry(State(state): State<AppState>, Path(id): Path<String>) -> 
         return Redirect::to("/library").into_response();
     }
 
-    let client = match library_client(&state).await {
-        Ok(c) => c,
+    let auth = match library_client(&state).await {
+        Ok(a) => a,
         Err(err) => return render_index_with_error(&state, &err).await,
     };
-    let meta = match fetch_audiobook_meta(&state, &client, &id).await {
+    let meta = match fetch_audiobook_meta(&state, &auth, &id).await {
         Ok(v) => v,
         Err(err) => return render_index_with_error(&state, &err).await,
     };
@@ -382,7 +391,7 @@ async fn handle_retry(State(state): State<AppState>, Path(id): Path<String>) -> 
         tokio::spawn(async move {
             download::run(
                 library_clone,
-                client,
+                auth.client,
                 scraper_clone,
                 config_clone,
                 caches_clone,
