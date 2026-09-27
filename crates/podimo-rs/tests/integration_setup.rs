@@ -206,3 +206,95 @@ async fn test_path_probe_with_empty_input_just_re_renders() {
     assert!(!body.contains("Probe result"));
     handle.abort();
 }
+
+#[tokio::test]
+async fn test_path_probe_returns_404_without_local_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let probe = tempfile::tempdir().unwrap();
+    let probe_path = probe.path().to_string_lossy().to_string();
+
+    let (addr, handle) = boot(base_config(dir, false, false)).await;
+    let resp = http_client()
+        .post(format!("http://{addr}/setup/test-path"))
+        .form(&[("path", probe_path.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "path probing should return 404 when LOCAL_CREDENTIALS=false"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("LOCAL_CREDENTIALS=true"),
+        "error message should mention LOCAL_CREDENTIALS: {body}"
+    );
+    // Verify that no probe file was created
+    assert!(
+        !probe
+            .path()
+            .read_dir()
+            .unwrap()
+            .any(|e| e.is_ok_and(|f| f.file_name().to_string_lossy().contains("podimo-rs-probe"))),
+        "no probe file should have been created"
+    );
+    std::mem::forget(probe);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_path_probe_returns_404_with_enable_library_but_no_local_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let probe = tempfile::tempdir().unwrap();
+    let probe_path = probe.path().to_string_lossy().to_string();
+    std::mem::forget(probe);
+
+    // enable_library=true, local_credentials=false
+    let (addr, handle) = boot(base_config(dir, true, false)).await;
+    let resp = http_client()
+        .post(format!("http://{addr}/setup/test-path"))
+        .form(&[("path", probe_path.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "path probing should return 404 even when ENABLE_LIBRARY=true but LOCAL_CREDENTIALS=false"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn setup_page_hides_probe_section_without_local_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let (addr, handle) = boot(base_config(dir, false, false)).await;
+
+    let resp = http_client()
+        .get(format!("http://{addr}/setup"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "/setup must render even without LOCAL_CREDENTIALS"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Library status"),
+        "Library status section should be present: {body}"
+    );
+    assert!(
+        !body.contains("Probe another path"),
+        "/setup should not show probe section without LOCAL_CREDENTIALS: {body}"
+    );
+    handle.abort();
+}

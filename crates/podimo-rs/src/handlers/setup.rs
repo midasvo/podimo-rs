@@ -10,10 +10,15 @@
 //!      so you can verify a candidate mount before committing.
 //!   3. Summarises what the library currently holds (entry count + total
 //!      bytes on disk).
+//!
+//! The path checks (1 and 2) write a probe file, and the page has no auth,
+//! so they only run with `LOCAL_CREDENTIALS=true`: an instance that's
+//! shared with other people doesn't let them probe its filesystem.
 
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Form, State};
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -37,13 +42,16 @@ struct SetupCtx<'a> {
     /// Whether `LIBRARY_DIR` would also actually function (gated on
     /// `LOCAL_CREDENTIALS=true`).
     library_active: bool,
-    /// Outcome of probing `LIBRARY_DIR`.
-    library_check: PathCheckView,
+    /// Outcome of probing `LIBRARY_DIR`, when `local_credentials` is true.
+    library_check: Option<PathCheckView>,
     /// Number of hydrated library entries, when active. `None` otherwise.
     entry_count: Option<usize>,
     /// Sum of `audio_size_bytes` across entries (rounded MB). `None` when not
     /// active.
     total_size_mb: Option<String>,
+    /// Whether path probing (via `/setup/test-path` and `LIBRARY_DIR` checks)
+    /// is enabled. Only true when `LOCAL_CREDENTIALS=true`.
+    probe_enabled: bool,
     /// Optional result of the user-submitted path test.
     test_path: Option<&'a str>,
     test_result: Option<PathCheckView>,
@@ -80,6 +88,13 @@ async fn handle_test_path(
     State(state): State<AppState>,
     Form(form): Form<TestPathForm>,
 ) -> Response {
+    if !state.config.local_credentials {
+        return (
+            StatusCode::NOT_FOUND,
+            "Path probing is only available with LOCAL_CREDENTIALS=true.",
+        )
+            .into_response();
+    }
     let trimmed = form.path.trim();
     if trimmed.is_empty() {
         return render_with(&state, None, None).await;
@@ -95,8 +110,12 @@ async fn render_with(
     test_path: Option<String>,
     test_result: Option<PathCheckView>,
 ) -> Response {
-    let library_check = check_path(Path::new(&state.config.library_dir)).await;
-    let library_view = view_from_check(library_check, &state.config.library_dir);
+    let library_view = if state.config.local_credentials {
+        let library_check = check_path(Path::new(&state.config.library_dir)).await;
+        Some(view_from_check(library_check, &state.config.library_dir))
+    } else {
+        None
+    };
 
     let (entry_count, total_size_mb) = if let Some(library) = &state.library {
         let entries = library.list().await;
@@ -119,6 +138,7 @@ async fn render_with(
         library_check: library_view,
         entry_count,
         total_size_mb,
+        probe_enabled: state.config.local_credentials,
         test_path: test_path.as_deref(),
         test_result,
         requires_local_credentials: state.config.enable_library && !state.config.local_credentials,

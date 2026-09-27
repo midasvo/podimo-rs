@@ -182,7 +182,9 @@
   <div class="setup-row">
     <span class="label">Library_Dir</span>
     <span class="value">{{ library_dir }}</span>
+    {% if library_check %}
     <span class="badge {{ library_check.summary_kind }}">{{ library_check.summary }}</span>
+    {% endif %}
   </div>
   {% if entry_count is not none %}
   <div class="setup-row">
@@ -197,6 +199,7 @@
   </div>
   {% endif %}
 
+  {% if library_check %}
   <div class="checks">
     <div class="check">
       <span class="k">Exists</span>
@@ -219,6 +222,7 @@
   {% if library_check.error %}
   <p class="hint-block"><strong>Error:</strong> {{ library_check.error }}</p>
   {% endif %}
+  {% endif %}
 
   {% if requires_local_credentials %}
   <p class="hint-block">
@@ -229,6 +233,7 @@
   {% endif %}
 </section>
 
+{% if probe_enabled %}
 <section class="setup-section">
   <h2>Probe another path</h2>
   <p class="hint-block">
@@ -280,6 +285,7 @@
   {% endif %}
   {% endif %}
 </section>
+{% endif %}
 
 <section class="setup-section">
   <h2>How to change <code>LIBRARY_DIR</code></h2>
