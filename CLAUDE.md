@@ -23,6 +23,12 @@ CI runs these on PRs and `main`. Pushes to `main` publish
 `ghcr.io/midasvo/podimo-rs:latest`; `vX.Y.Z` tags publish versioned images
 (bump `crates/podimo-rs/Cargo.toml` to match first).
 
+Renovate (`.github/renovate.json5`, checked by `renovate-config.yml`) runs
+`cargo update` early on Mondays and merges that PR itself once CI passes, so
+`:latest` picks up compatible crate releases weekly. Versions outside a
+`Cargo.toml` range are breaking and get their own PR, merged by hand, as do
+Docker and GitHub Actions updates.
+
 ## Routes
 
 | Route | Handler |
@@ -130,6 +136,8 @@ failed probe). Entries live in moka and are mirrored to
   `PODIMO_LOG_JSON=true` switches to JSON.
 - Newer clippy flags `Result<_, Response>` as `result_large_err`. Handlers
   allow it locally because the error goes straight back to axum.
+- `bincode` is unmaintained: 3.0.0 contains only a `compile_error!`. Stay on
+  1.x; Renovate skips it.
 
 ## Known gaps
 
