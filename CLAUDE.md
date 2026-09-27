@@ -72,8 +72,11 @@ crates/podimo-rs/tests/       integration tests; Podimo is mocked with wiremock
    to `nl` and `nl-NL`. It also validates the ID and checks the block list
    (a listed token anywhere in the URL gives `410`).
 2. `PodimoClient::login` does three GraphQL calls; the token is cached under
-   `sha256(user~pass)`. `get_podcasts` pages episodes 100 at a time; `?limit`
-   stops early and is part of the cache key.
+   `sha256(user~pass)`. `get_podcasts` pages episodes 100 at a time and
+   `?limit` stops after the pages it needs. The listing is cached per account
+   (that hash) and show: `p<n>` for the first `n` pages, shared by every limit
+   in that hundred, or `all` once the show ran out, which serves any limit.
+   The audiobook caches are per account too, since payloads hold signed URLs.
 3. `rss::podcasts_to_rss` renders the feed. HLS episodes link to `/stream`
    (below); other enclosures are HEAD-probed for their size.
 

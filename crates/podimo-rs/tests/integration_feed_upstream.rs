@@ -4,6 +4,8 @@
 //! pre-populated so no episode-media HEAD probe goes out.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -299,10 +301,9 @@ async fn limit_query_param_avoids_full_pagination() {
                 }))
             } else if query.contains("ChannelEpisodesQuery") {
                 ep_calls_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // Hand back exactly the per-page-size the caller asked for. With
-                // limit=20 the request is for 20 → 20 returned (short page → loop
-                // exits naturally). Without a limit (or limit > 100) the per-page
-                // size is 100 → 100 returned → pagination would continue.
+                // Hand back exactly the page size the caller asked for. That is
+                // always a full page of 100, so the show never runs out and only
+                // the limit can stop the paging: limit=20 needs one page.
                 let vars = body.get("variables").cloned().unwrap_or(Value::Null);
                 let want = vars
                     .get("limit")
@@ -346,7 +347,8 @@ async fn limit_query_param_avoids_full_pagination() {
 
     let config = make_config(format!("{}/graphql", server.uri()));
     let state = AppState::new(config).await.unwrap();
-    // Pre-populate head cache so HEAD probes short-circuit for all 20 episode ids.
+    // Pre-populate head cache so HEAD probes short-circuit for the 20 episodes
+    // the feed keeps of the 100 fetched.
     for i in 0..20 {
         state
             .caches
@@ -370,7 +372,8 @@ async fn limit_query_param_avoids_full_pagination() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // limit=20 ≤ PAGE_MAX(100), so exactly one ChannelEpisodesQuery should fire.
+    // limit=20 fits in one page of 100, so exactly one ChannelEpisodesQuery
+    // should fire.
     assert_eq!(
         ep_calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -379,6 +382,176 @@ async fn limit_query_param_avoids_full_pagination() {
 
     let body = resp.text().await.unwrap();
     assert_eq!(body.matches("<item>").count(), 20, "want 20 items in feed");
+    handle.abort();
+}
+
+/// Answers the three login queries, with a token per email address:
+/// `token-<email>`. `None` for any other query.
+fn login_response(body: &Value) -> Option<ResponseTemplate> {
+    let query = body["query"].as_str().unwrap_or("");
+    let data = if query.contains("AuthorizationPreregisterUser") {
+        json!({ "tokenWithPreregisterUser": { "token": "preauth-token" } })
+    } else if query.contains("OnboardingQuery") {
+        json!({ "userOnboardingFlow": { "id": "onboarding-id" } })
+    } else if query.contains("AuthorizationAuthorize") {
+        let email = body["variables"]["email"].as_str().unwrap_or("");
+        json!({ "tokenWithCredentials": { "token": format!("token-{email}") } })
+    } else {
+        return None;
+    };
+    Some(ResponseTemplate::new(200).set_body_json(json!({ "data": data })))
+}
+
+/// A show of `total` episodes, paged like Podimo does: each
+/// `ChannelEpisodesQuery` returns up to `limit` episodes from `offset`.
+/// Returns the number of those calls so far. The episodes are HLS, so the
+/// feed renders without HEAD probes.
+async fn install_show_mock(server: &MockServer, total: usize) -> Arc<AtomicUsize> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            if let Some(resp) = login_response(&body) {
+                return resp;
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let offset = body["variables"]["offset"].as_u64().unwrap_or(0) as usize;
+            let limit = body["variables"]["limit"].as_u64().unwrap_or(0) as usize;
+            let episodes: Vec<Value> = (offset..total.min(offset + limit))
+                .map(|i| {
+                    json!({
+                        "id": format!("ep{i}"),
+                        "title": format!("Episode {i}"),
+                        "publishDatetime": "2024-01-01T12:00:00Z",
+                        "audio": null,
+                        "streamMedia": {
+                            "url": format!("https://media-cdn-episodes.podimo.com/ep{i}/ep{i}.m3u8"),
+                            "duration": 1
+                        }
+                    })
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "podcast": { "title": "Test Show" }, "episodes": episodes }
+            }))
+        })
+        .mount(server)
+        .await;
+    calls
+}
+
+/// Number of `<item>`s in the feed for `query` (e.g. `?limit=20`).
+async fn feed_items(addr: SocketAddr, query: &str) -> usize {
+    let resp = http_client()
+        .get(format!("http://{addr}/feed/{PODCAST_ID}.xml{query}"))
+        .header("Authorization", basic_auth("a@b.com,nl,nl-NL", "pw"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{query}");
+    resp.text().await.unwrap().matches("<item>").count()
+}
+
+#[tokio::test]
+async fn accounts_do_not_share_cached_payloads() {
+    // Podimo signs the media URLs in a listing for the account that asked. A
+    // second account must get its own listing, not the cached one.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            if let Some(resp) = login_response(&body) {
+                return resp;
+            }
+            let who = req
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let mut payload = fake_episodes_payload();
+            payload["data"]["episodes"][0]["audio"]["url"] =
+                json!(format!("https://example.com/ep1.mp3?who={who}"));
+            ResponseTemplate::new(200).set_body_json(payload)
+        })
+        .mount(&server)
+        .await;
+
+    let config = make_config(format!("{}/graphql", server.uri()));
+    let state = AppState::new(config).await.unwrap();
+    state
+        .caches
+        .head
+        .insert(
+            "ep1".to_string(),
+            HeadInfo {
+                content_length: "9876".into(),
+                content_type: "audio/mpeg".into(),
+            },
+        )
+        .await;
+    let (addr, handle) = boot_with_state(state).await;
+
+    for email in ["a@b.com", "c@d.com"] {
+        let body = http_client()
+            .get(format!("http://{addr}/feed/{PODCAST_ID}.xml"))
+            .header(
+                "Authorization",
+                basic_auth(&format!("{email},nl,nl-NL"), "pw"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains(&format!("who=token-{email}")),
+            "{email}: {body}"
+        );
+        assert_eq!(body.matches("who=").count(), 1, "{email}: {body}");
+    }
+    handle.abort();
+}
+
+#[tokio::test]
+async fn limits_in_the_same_hundred_share_a_cache_entry() {
+    let server = MockServer::start().await;
+    let calls = install_show_mock(&server, 1000).await;
+    let state = AppState::new(make_config(format!("{}/graphql", server.uri())))
+        .await
+        .unwrap();
+    let (addr, handle) = boot_with_state(state).await;
+
+    assert_eq!(feed_items(addr, "?limit=20").await, 20);
+    assert_eq!(feed_items(addr, "?limit=50").await, 50);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "both fit the first page");
+
+    assert_eq!(feed_items(addr, "?limit=150").await, 150);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "limit=150 fetches two pages"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_listing_that_reached_the_end_serves_any_limit() {
+    // 30 episodes: the first page comes back short, so the show is complete.
+    let server = MockServer::start().await;
+    let calls = install_show_mock(&server, 30).await;
+    let state = AppState::new(make_config(format!("{}/graphql", server.uri())))
+        .await
+        .unwrap();
+    let (addr, handle) = boot_with_state(state).await;
+
+    assert_eq!(feed_items(addr, "?limit=500").await, 30);
+    assert_eq!(feed_items(addr, "?limit=501").await, 30);
+    assert_eq!(feed_items(addr, "").await, 30);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     handle.abort();
 }
 

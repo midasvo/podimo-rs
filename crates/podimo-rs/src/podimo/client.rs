@@ -179,12 +179,17 @@ impl PodimoClient {
         Ok(())
     }
 
-    /// Page through `podcastEpisodes` and return the payload. When `limit` is
-    /// `Some(n)`, fetch only as many pages as needed for `n` episodes — for a
-    /// 500-episode show with `limit=Some(20)` that's one GraphQL call instead
-    /// of six. When `None`, paginate until exhausted. Cached as `Arc<Value>`
-    /// keyed by `(podcast_id, limit)` so the user-facing `?limit=N` doesn't
-    /// poison the unlimited cache (and vice-versa).
+    /// Page through `podcastEpisodes`, newest first, and return the payload.
+    /// Always fetches whole pages of 100. With `limit` (the feed's `?limit=`)
+    /// paging stops once there are enough episodes: for a 500-episode show,
+    /// `limit=Some(20)` is one GraphQL call instead of six. Without one, it
+    /// pages until the show runs out. The caller trims to `limit`.
+    ///
+    /// Cached per account, since the payload holds signed media URLs issued
+    /// to this login. Limits in the same hundred share an entry (`p1` for
+    /// 1..=100, `p2` for 101..=200, …), and a listing that reached the end of
+    /// the show is stored as `all` and serves any limit. So an account has at
+    /// most one entry per page of a show, whatever limits are requested.
     pub async fn get_podcasts(
         &self,
         scraper: &Client,
@@ -193,12 +198,17 @@ impl PodimoClient {
         limit: Option<usize>,
         podcast_cache: &TtlCache<Arc<Value>>,
     ) -> Result<Arc<Value>, ClientError> {
-        let cache_key = match limit {
-            Some(n) => format!("{podcast_id}__{n}"),
-            None => format!("{podcast_id}__all"),
-        };
-        if let Some(cached) = podcast_cache.get(&cache_key).await {
+        const PAGE_MAX: usize = 100;
+        let all_key = format!("{}__{podcast_id}__all", self.key);
+        if let Some(cached) = podcast_cache.get(&all_key).await {
             return Ok(cached);
+        }
+        let pages_wanted = limit.map(|n| n.div_ceil(PAGE_MAX));
+        let pages_key = pages_wanted.map(|p| format!("{}__{podcast_id}__p{p}", self.key));
+        if let Some(key) = &pages_key {
+            if let Some(cached) = podcast_cache.get(key).await {
+                return Ok(cached);
+            }
         }
 
         let token = self
@@ -251,19 +261,15 @@ impl PodimoClient {
             }
         "#;
 
-        const PAGE_MAX: i64 = 100;
-        let mut offset = 0_i64;
-        let mut accumulated = 0_usize;
+        let mut offset = 0;
+        let mut pages = 0;
         let mut full: Option<Value> = None;
 
-        loop {
-            let want_this_page: i64 = match limit {
-                Some(target) => (target - accumulated).min(PAGE_MAX as usize) as i64,
-                None => PAGE_MAX,
-            };
+        // True when the show ran out, false when `pages_wanted` stopped it.
+        let exhausted = loop {
             let variables = json!({
                 "podcastId": podcast_id,
-                "limit": want_this_page,
+                "limit": PAGE_MAX,
                 "offset": offset,
                 "sorting": "PUBLISHED_DESCENDING",
             });
@@ -271,8 +277,7 @@ impl PodimoClient {
             let page_episodes_len = result
                 .get("episodes")
                 .and_then(|e| e.as_array())
-                .map(|a| a.len() as i64)
-                .unwrap_or(0);
+                .map_or(0, Vec::len);
 
             match full.as_mut() {
                 None => {
@@ -288,24 +293,28 @@ impl PodimoClient {
                 }
             }
 
-            accumulated += page_episodes_len as usize;
-            // Short page = upstream is exhausted; satisfied = caller's limit reached.
-            let short_page = page_episodes_len < want_this_page;
-            let satisfied = limit.is_some_and(|n| accumulated >= n);
-            if short_page || satisfied {
-                break;
+            pages += 1;
+            if page_episodes_len < PAGE_MAX {
+                break true;
+            }
+            if pages_wanted.is_some_and(|wanted| pages >= wanted) {
+                break false;
             }
             offset += page_episodes_len;
-        }
+        };
 
         let result = full.ok_or_else(|| ClientError::Upstream("no episodes returned".into()))?;
         let arc = Arc::new(result);
+        let cache_key = match pages_key {
+            Some(key) if !exhausted => key,
+            _ => all_key,
+        };
         podcast_cache.insert(cache_key, Arc::clone(&arc)).await;
         Ok(arc)
     }
 
     /// Fetch the metadata for a single audiobook via `audiobookById`. Cached as
-    /// `Arc<Value>` keyed by `audiobook_id`. The schema mirrors what
+    /// `Arc<Value>` per account and `audiobook_id`. The schema mirrors what
     /// `audiobook-dl` uses, including `authors`, `narrators`, and
     /// `coverImage.url`.
     pub async fn get_audiobook(
@@ -315,7 +324,8 @@ impl PodimoClient {
         audiobook_id: &str,
         meta_cache: &TtlCache<Arc<Value>>,
     ) -> Result<Arc<Value>, ClientError> {
-        if let Some(cached) = meta_cache.get(audiobook_id).await {
+        let cache_key = format!("{}__{audiobook_id}", self.key);
+        if let Some(cached) = meta_cache.get(&cache_key).await {
             return Ok(cached);
         }
 
@@ -358,14 +368,13 @@ impl PodimoClient {
         }
 
         let arc = Arc::new(data);
-        meta_cache
-            .insert(audiobook_id.to_string(), Arc::clone(&arc))
-            .await;
+        meta_cache.insert(cache_key, Arc::clone(&arc)).await;
         Ok(arc)
     }
 
-    /// Fetch the short-lived signed audio URL for an audiobook. Cached with a
-    /// short TTL since the upstream URL itself expires.
+    /// Fetch the short-lived signed audio URL for an audiobook. Cached per
+    /// account, since the URL is issued to this login, and with a short TTL
+    /// since the URL itself expires.
     pub async fn get_audiobook_audio_url(
         &self,
         scraper: &Client,
@@ -373,7 +382,8 @@ impl PodimoClient {
         audiobook_id: &str,
         audio_cache: &TtlCache<String>,
     ) -> Result<String, ClientError> {
-        if let Some(cached) = audio_cache.get(audiobook_id).await {
+        let cache_key = format!("{}__{audiobook_id}", self.key);
+        if let Some(cached) = audio_cache.get(&cache_key).await {
             return Ok(cached);
         }
 
@@ -396,9 +406,7 @@ impl PodimoClient {
         let url = get_str(&data, &["audiobookAudioById", "url"])
             .ok_or_else(|| ClientError::GraphQl("no audiobook audio url in response".into()))?
             .to_string();
-        audio_cache
-            .insert(audiobook_id.to_string(), url.clone())
-            .await;
+        audio_cache.insert(cache_key, url.clone()).await;
         Ok(url)
     }
 }
