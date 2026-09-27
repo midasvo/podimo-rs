@@ -14,7 +14,7 @@ use crate::state::AppState;
 use crate::util::{amp_arg, request_base_url};
 
 pub(crate) fn router() -> Router<AppState> {
-    Router::new().route("/feed/:podcast_id", get(serve))
+    Router::new().route("/feed/{podcast_id}", get(serve))
 }
 
 async fn serve(

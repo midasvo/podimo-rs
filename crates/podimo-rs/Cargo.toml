@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Web
-axum = { version = "0.7", features = ["macros", "tokio", "http1", "query", "form"] }
+axum = { version = "0.8", features = ["macros", "tokio", "http1", "query", "form"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace"] }
 http = "1"

@@ -34,9 +34,9 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/library", get(render_index))
         .route("/library/add", post(handle_add))
-        .route("/library/:id/remove", post(handle_remove))
-        .route("/library/:id/audio.mp3", get(serve_audio))
-        .route("/library/:id/cover.jpg", get(serve_cover))
+        .route("/library/{id}/remove", post(handle_remove))
+        .route("/library/{id}/audio.mp3", get(serve_audio))
+        .route("/library/{id}/cover.jpg", get(serve_cover))
 }
 
 // `Response` is a large type but here it's an alternative-path return value,
