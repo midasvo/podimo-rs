@@ -28,6 +28,8 @@ fn make_test_config() -> Config {
         local_credentials: false,
         podimo_email: None,
         podimo_password: None,
+        podimo_region: "nl".into(),
+        podimo_locale: "nl-NL".into(),
         store_tokens_on_disk: false,
         token_cache_time: 60,
         podcast_cache_time: 60,

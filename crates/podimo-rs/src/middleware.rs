@@ -20,11 +20,12 @@ pub(crate) async fn after_request(
     let is_success = response.status().is_success();
     let headers = response.headers_mut();
 
-    if matches!(method, Method::GET | Method::HEAD)
+    // Feeds and episode audio: what podcatchers fetch, from any origin.
+    let is_content = matches!(method, Method::GET | Method::HEAD)
         && (path.starts_with("/feed/")
             || path.starts_with("/audiobook/")
-            || path.starts_with("/stream/"))
-    {
+            || path.starts_with("/stream/"));
+    if is_content {
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_ORIGIN,
             HeaderValue::from_static("*"),
@@ -35,9 +36,10 @@ pub(crate) async fn after_request(
         );
     }
 
-    let cc = if path == "/healthz" {
-        "no-store"
-    } else if is_success {
+    // Only content may be cached. The HTML pages show state that changes
+    // (library downloads) or credentials (the generated feed URL), and a
+    // browser may answer a navigation from a cached copy.
+    let cc = if is_content && is_success {
         "max-age=900"
     } else {
         "no-store"

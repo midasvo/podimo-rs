@@ -88,6 +88,7 @@ All configuration is done via environment variables (or `.env` file):
 | `PUBLIC_FEEDS` | `false` | If `true`, feeds are served without auth (uses `.env` credentials). |
 | `ENABLE_LIBRARY` | `false` | Enables the `/library` audiobook management UI. |
 | `LOCAL_CREDENTIALS` | `false` | Must be `true` to use `/setup` and `/library`. |
+| `PODIMO_REGION`, `PODIMO_LOCALE` | `nl`, `nl-NL` | Region and locale of the account in `.env`: used by the library, and by feeds unless the URL has `?region=` and `?locale=`. |
 | `LIBRARY_DIR` | `/audiobooks` | Where audiobooks are stored. |
 | `CACHE_DIR` | `/cache` | Where metadata and tokens are cached. |
 | `BLOCK_LIST_FILE` | None | Path to a plain text file of podcast IDs/slugs to block (one per line). |

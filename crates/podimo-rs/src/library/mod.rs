@@ -276,10 +276,16 @@ impl Library {
     }
 }
 
+/// Longest path segment [`sanitize_segment`] returns, in bytes. File names
+/// are limited in bytes (255 on ext4 and most other filesystems), not
+/// characters, and the audio file adds `.mp3.partial` to the title.
+const MAX_SEGMENT_BYTES: usize = 200;
+
 /// Filesystem-safe form of a path segment. Replaces FS-unsafe + control chars
 /// with whitespace, collapses runs of whitespace into a single space, trims
 /// leading/trailing whitespace + trailing dots (Windows can't handle either),
-/// and falls back to `fallback` when the result would otherwise be empty.
+/// cuts it to [`MAX_SEGMENT_BYTES`] on a character boundary, and falls back to
+/// `fallback` when the result would otherwise be empty.
 fn sanitize_segment(raw: &str, fallback: &str) -> String {
     let replaced: String = raw
         .chars()
@@ -292,12 +298,17 @@ fn sanitize_segment(raw: &str, fallback: &str) -> String {
     // `split_whitespace` collapses any run of Unicode whitespace into a single
     // ASCII space, which is exactly what we want.
     let collapsed = replaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed.trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+    let mut end = 0;
+    for (i, c) in collapsed.char_indices() {
+        if i + c.len_utf8() > MAX_SEGMENT_BYTES {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    // Trimmed after the cut, which can leave a trailing dot or space too.
+    let trimmed = collapsed[..end].trim_end_matches(|c: char| c == '.' || c.is_whitespace());
     if trimmed.is_empty() {
         fallback.to_string()
-    } else if trimmed.chars().count() > 200 {
-        // Keep filenames well under the 255-byte limit on common filesystems.
-        trimmed.chars().take(200).collect()
     } else {
         trimmed.to_string()
     }
@@ -594,6 +605,21 @@ mod tests {
         let long = "x".repeat(500);
         let s = sanitize_segment(&long, "x");
         assert!(s.len() <= 200);
+    }
+
+    #[test]
+    fn sanitize_limits_bytes_not_characters() {
+        // 150 three-byte characters are 450 bytes: too long for a file name
+        // although only 150 characters.
+        let cjk = sanitize_segment(&"界".repeat(150), "x");
+        assert!(cjk.len() <= 200, "{} bytes", cjk.len());
+        assert_eq!(cjk, "界".repeat(66));
+        // Exactly 200 bytes fits as it is.
+        let accented = "é".repeat(100);
+        assert_eq!(sanitize_segment(&accented, "x"), accented);
+        // A cut that ends in " ." leaves neither behind.
+        let title = format!("{} .bbbb", "a".repeat(198));
+        assert_eq!(sanitize_segment(&title, "x"), "a".repeat(198));
     }
 
     #[tokio::test]

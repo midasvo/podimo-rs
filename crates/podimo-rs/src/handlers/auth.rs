@@ -80,10 +80,10 @@ pub(crate) async fn authorize_request(
     content_kind_label: &str,
 ) -> Result<Authorized, Response> {
     let (username, password, region, locale) = if state.config.local_credentials {
-        let region =
-            amp_arg(|k| params.get(k).map(String::as_str), "region").unwrap_or_else(|| "nl".into());
+        let region = amp_arg(|k| params.get(k).map(String::as_str), "region")
+            .unwrap_or_else(|| state.config.podimo_region.clone());
         let locale = amp_arg(|k| params.get(k).map(String::as_str), "locale")
-            .unwrap_or_else(|| "nl-NL".into());
+            .unwrap_or_else(|| state.config.podimo_locale.clone());
         let Some(email) = state.config.podimo_email.clone() else {
             return Err(AppError::Internal(
                 "LOCAL_CREDENTIALS enabled but PODIMO_EMAIL unset".into(),

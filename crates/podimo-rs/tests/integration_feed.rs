@@ -26,6 +26,8 @@ fn make_test_config<F: FnOnce(&mut Config)>(tweak: F) -> Config {
         local_credentials: false,
         podimo_email: None,
         podimo_password: None,
+        podimo_region: "nl".into(),
+        podimo_locale: "nl-NL".into(),
         store_tokens_on_disk: false,
         token_cache_time: 60,
         podcast_cache_time: 60,
@@ -364,7 +366,9 @@ async fn get_feed_advertises_get_head_but_not_post() {
 }
 
 #[tokio::test]
-async fn two_xx_response_has_max_age_900_cache_control() {
+async fn html_pages_are_not_cached() {
+    // The form page (and the generated feed URL it shows after a POST) must
+    // never come from a browser cache; only feeds and audio get max-age.
     let (addr, handle) = boot().await;
     let resp = http_client()
         .get(format!("http://{addr}/"))
@@ -372,7 +376,7 @@ async fn two_xx_response_has_max_age_900_cache_control() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers().get("cache-control").unwrap(), "max-age=900");
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
     handle.abort();
 }
 
