@@ -17,7 +17,7 @@ use crate::handlers::auth::authorize_request;
 use crate::state::AppState;
 
 pub(crate) fn router() -> Router<AppState> {
-    Router::new().route("/audiobook/:audiobook_id", get(serve))
+    Router::new().route("/audiobook/{audiobook_id}", get(serve))
 }
 
 async fn serve(

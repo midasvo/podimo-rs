@@ -28,8 +28,8 @@ use crate::util::PODCAST_ID_RE;
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
-        .route("/stream/:file", get(serve_aac))
-        .route("/stream/:token/:file", get(serve_transcoded))
+        .route("/stream/{file}", get(serve_aac))
+        .route("/stream/{token}/{file}", get(serve_transcoded))
 }
 
 async fn serve_transcoded(
