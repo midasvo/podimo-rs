@@ -226,7 +226,7 @@ pub fn select_variant(text: &str, base: &Url) -> Result<Option<Url>, HlsError> {
             pending_bandwidth = Some(attribute(attrs, "BANDWIDTH").unwrap_or(0));
         } else if !line.is_empty() && !line.starts_with('#') {
             if let Some(bandwidth) = pending_bandwidth.take() {
-                if best.map_or(true, |(b, _)| bandwidth > b) {
+                if best.is_none_or(|(b, _)| bandwidth > b) {
                     best = Some((bandwidth, line));
                 }
             }
@@ -499,7 +499,7 @@ impl TsDemuxer {
     /// Append the AAC payload carried in `data` (one or more whole TS
     /// packets) to `out`.
     pub fn push(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), HlsError> {
-        for packet in data.chunks_exact(TS_PACKET_LEN) {
+        for packet in data.as_chunks::<TS_PACKET_LEN>().0 {
             if packet[0] != TS_SYNC_BYTE {
                 return Err(HlsError::Demux("lost MPEG-TS sync"));
             }
@@ -549,7 +549,8 @@ fn psi_section(payload: &[u8]) -> Option<&[u8]> {
 
 fn parse_pat(payload: &[u8]) -> Option<u16> {
     let section = psi_section(payload)?;
-    section.get(8..)?.chunks_exact(4).find_map(|entry| {
+    let (entries, _) = section.get(8..)?.as_chunks::<4>();
+    entries.iter().find_map(|entry| {
         let program = (u16::from(entry[0]) << 8) | u16::from(entry[1]);
         (program != 0).then(|| (u16::from(entry[2] & 0x1F) << 8) | u16::from(entry[3]))
     })
@@ -614,7 +615,7 @@ mod tests {
             p.push(af_len as u8);
             if af_len > 0 {
                 p.push(0x00); // adaptation flags
-                p.extend(std::iter::repeat(0xFF).take(af_len - 1));
+                p.extend(std::iter::repeat_n(0xFF, af_len - 1));
             }
         }
         p.extend_from_slice(payload);
