@@ -436,30 +436,8 @@ async fn post_graphql(
 
     let body = Body { query, variables };
 
-    let (url, response) = if let Some(api_key) = &config.scraper_api {
-        // ScraperAPI: rewrite the URL through their proxy endpoint.
-        let url = format!(
-            "https://api.scraperapi.com?api_key={}&url={}&keep_headers=true",
-            urlencoding::encode(api_key),
-            urlencoding::encode(config.graphql_url.as_str()),
-        );
-        let resp = build_request(scraper, &url, headers, &body).await?;
-        (url, resp)
-    } else if let Some(api_key) = &config.zenrows_api {
-        // ZenRows: same URL, but with a Bearer-style API key as part of the host.
-        // The Python client swaps to `ZenRowsClient(api_key)`. We mirror that here
-        // by hitting their proxy endpoint directly with the api key as a query arg.
-        let url = format!(
-            "https://api.zenrows.com/v1/?apikey={}&url={}",
-            urlencoding::encode(api_key),
-            urlencoding::encode(config.graphql_url.as_str()),
-        );
-        let resp = build_request(scraper, &url, headers, &body).await?;
-        (url, resp)
-    } else {
-        let resp = build_request(scraper, config.graphql_url.as_str(), headers, &body).await?;
-        (config.graphql_url.as_str().to_string(), resp)
-    };
+    let url = graphql_request_url(config);
+    let response = build_request(scraper, &url, headers, &body).await?;
 
     if !response.status().is_success() {
         // Don't leak proxy API keys in the URL — log the configured destination
@@ -471,10 +449,9 @@ async fn post_graphql(
         )));
     }
 
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| ClientError::Upstream(format!("invalid JSON: {e}")))?;
+    let body: Value = response.json().await.map_err(|e| {
+        ClientError::Upstream(format!("invalid JSON: {}", describe_reqwest_error(e)))
+    })?;
 
     if let Some(errors) = body.get("errors").and_then(|e| e.as_array()) {
         let msg = errors
@@ -490,6 +467,27 @@ async fn post_graphql(
         .ok_or_else(|| ClientError::GraphQl("no data field in response".into()))
 }
 
+/// Where GraphQL requests go: through ScraperAPI or ZenRows when one is
+/// configured (in that order), else straight to `graphql_url`. Both proxies
+/// only pass our headers on (the auth tokens among them) when asked to.
+/// The proxy URLs carry the API key, so they must never end up in errors.
+fn graphql_request_url(config: &Config) -> String {
+    let target = urlencoding::encode(&config.graphql_url);
+    if let Some(api_key) = &config.scraper_api {
+        format!(
+            "https://api.scraperapi.com?api_key={}&url={target}&keep_headers=true",
+            urlencoding::encode(api_key),
+        )
+    } else if let Some(api_key) = &config.zenrows_api {
+        format!(
+            "https://api.zenrows.com/v1/?apikey={}&url={target}&custom_headers=true",
+            urlencoding::encode(api_key),
+        )
+    } else {
+        config.graphql_url.clone()
+    }
+}
+
 fn host_only(url: &str) -> String {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     after_scheme
@@ -497,6 +495,17 @@ fn host_only(url: &str) -> String {
         .next()
         .unwrap_or("")
         .to_string()
+}
+
+/// `reqwest::Error` text without the request URL, which carries the
+/// SCRAPER_API / ZENROWS_API key. Names the host instead.
+fn describe_reqwest_error(err: reqwest::Error) -> String {
+    let host = err.url().and_then(|u| u.host_str()).map(str::to_owned);
+    let msg = err.without_url().to_string();
+    match host {
+        Some(host) => format!("{msg} (target host: {host})"),
+        None => msg,
+    }
 }
 
 async fn build_request<B: Serialize>(
@@ -514,5 +523,82 @@ async fn build_request<B: Serialize>(
     }
     req.send()
         .await
-        .map_err(|e| ClientError::Upstream(e.to_string()))
+        .map_err(|e| ClientError::Upstream(describe_reqwest_error(e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::podimo::hls::StreamFormat;
+
+    fn config(scraper_api: Option<&str>, zenrows_api: Option<&str>) -> Config {
+        Config {
+            hostname: "localhost:12104".into(),
+            bind_host: "127.0.0.1:12104".into(),
+            protocol: "http".into(),
+            http_proxy: None,
+            zenrows_api: zenrows_api.map(String::from),
+            scraper_api: scraper_api.map(String::from),
+            cache_dir: "./cache".into(),
+            block_list_file: "/dev/null".into(),
+            debug: false,
+            local_credentials: false,
+            podimo_email: None,
+            podimo_password: None,
+            store_tokens_on_disk: false,
+            token_cache_time: 60,
+            podcast_cache_time: 60,
+            head_cache_time: 60,
+            audiobook_audio_cache_time: 60,
+            enable_library: false,
+            library_dir: "./library".into(),
+            public_feeds: false,
+            stream_format: StreamFormat::M4a,
+            stream_links_from_request: true,
+            graphql_url: "https://podimo.com/graphql".into(),
+        }
+    }
+
+    const ENCODED_GRAPHQL_URL: &str = "url=https%3A%2F%2Fpodimo.com%2Fgraphql";
+
+    #[test]
+    fn zenrows_is_asked_to_pass_our_headers_on() {
+        let url = graphql_request_url(&config(None, Some("ZR KEY")));
+        assert!(url.starts_with("https://api.zenrows.com/v1/?"), "{url}");
+        assert!(url.contains("apikey=ZR%20KEY"), "{url}");
+        assert!(url.contains(ENCODED_GRAPHQL_URL), "{url}");
+        assert!(url.contains("&custom_headers=true"), "{url}");
+    }
+
+    #[test]
+    fn scraperapi_comes_first_and_keeps_our_headers() {
+        let url = graphql_request_url(&config(Some("SA"), Some("ZR")));
+        assert!(
+            url.starts_with("https://api.scraperapi.com?api_key=SA&"),
+            "{url}"
+        );
+        assert!(url.contains(ENCODED_GRAPHQL_URL), "{url}");
+        assert!(url.contains("&keep_headers=true"), "{url}");
+    }
+
+    #[test]
+    fn without_a_proxy_key_requests_go_straight_to_podimo() {
+        assert_eq!(
+            graphql_request_url(&config(None, None)),
+            "https://podimo.com/graphql"
+        );
+    }
+
+    #[tokio::test]
+    async fn reqwest_errors_do_not_leak_the_url() {
+        // Port 1 on localhost refuses the connection.
+        let err = reqwest::Client::new()
+            .post("http://127.0.0.1:1/?api_key=SECRET")
+            .send()
+            .await
+            .unwrap_err();
+        let msg = describe_reqwest_error(err);
+        assert!(!msg.contains("SECRET"), "{msg}");
+        assert!(msg.contains("127.0.0.1"), "{msg}");
+    }
 }

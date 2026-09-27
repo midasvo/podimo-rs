@@ -119,7 +119,8 @@ impl Config {
         tracing::info!(target: "podimo", "PUBLIC_FEEDS: {}", self.public_feeds);
         tracing::info!(target: "podimo", "STREAM_FORMAT: {}", self.stream_format.extension());
         tracing::info!(target: "podimo", "STREAM_LINKS_FROM_REQUEST: {}", self.stream_links_from_request);
-        tracing::info!(target: "podimo", "HTTP_PROXY: {:?}", self.http_proxy);
+        // A proxy URL can hold `user:password@`, so only say whether it's set.
+        tracing::info!(target: "podimo", "HTTP_PROXY set: {}", self.http_proxy.is_some());
         tracing::info!(target: "podimo", "ZENROWS_API set: {}", self.zenrows_api.is_some());
         tracing::info!(target: "podimo", "SCRAPER_API set: {}", self.scraper_api.is_some());
         tracing::info!(target: "podimo", "CACHE_DIR: {}", self.cache_dir);
