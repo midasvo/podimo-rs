@@ -5,7 +5,7 @@ Guidance for Claude Code in this repository.
 ## What this is
 
 Self-hosted proxy that serves Podimo shows and audiobooks as RSS feeds. Rust:
-axum on tokio, reqwest (rustls), moka + bincode caches, minijinja templates, the
+axum on tokio, reqwest (rustls), moka caches, minijinja templates, the
 `rss` crate. One binary, `podimo-rs`, on port 12104. Podimo delivers episode
 audio as HLS; ffmpeg (must be on `PATH`) turns it into one file per episode.
 
@@ -58,7 +58,7 @@ crates/podimo-rs/src/
   podimo/hls.rs       playlist parsing, TS → ADTS demux, ffmpeg transcode
   podimo/head.rs      HEAD probe for the size of non-HLS enclosures
   library/            audiobook downloads and on-disk layout
-  cache.rs            TtlCache: moka in memory, bincode files on disk
+  cache.rs            TtlCache: moka in memory, JSON files on disk
   util.rs             helpers: auth parsing, request_base_url, amp_arg, …
 crates/podimo-rs/templates/   HTML, embedded with include_str!
 crates/podimo-rs/tests/       integration tests; Podimo is mocked with wiremock
@@ -119,8 +119,9 @@ of ~10 s MPEG-TS segments with AAC-LC. There is no progressive file upstream.
 `tokens` (5 days), `podcasts` (6 h), `audiobook_meta` (6 h), `audiobook_audio`
 (10 min) and `head` (7 days, read with `get_no_expire` so a stale size beats a
 failed probe). Entries live in moka and are mirrored to
-`<CACHE_DIR>/<name>/<key>.bin`, loaded lazily on first read.
-`STORE_TOKENS_ON_DISK=false` keeps tokens in memory only.
+`<CACHE_DIR>/<name>/<key>.json`, loaded lazily on first read.
+`STORE_TOKENS_ON_DISK=false` keeps tokens in memory only. Startup deletes the
+bincode files that 1.2.0 and earlier left in `<CACHE_DIR>/*_cache/`.
 
 ## Gotchas
 
@@ -136,11 +137,11 @@ failed probe). Entries live in moka and are mirrored to
   `PODIMO_LOG_JSON=true` switches to JSON.
 - Newer clippy flags `Result<_, Response>` as `result_large_err`. Handlers
   allow it locally because the error goes straight back to axum.
-- `bincode` is unmaintained: 3.0.0 contains only a `compile_error!`. Stay on
-  1.x; Renovate skips it.
+- The disk mirror must stay JSON or another self-describing format:
+  `serde_json::Value` (in `podcasts` and `audiobook_meta`) can't be read back
+  from bincode or postcard, and a failed read looks like a cache miss.
 
 ## Known gaps
 
 - Audiobook chapters: `audiobookAudioById` returns one file without chapters.
 - The HTTP client shares one cookie jar across all users.
-- Caches load lazily, so the first request after a restart logs in again.
