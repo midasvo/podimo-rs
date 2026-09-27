@@ -43,7 +43,10 @@
   // and main has none.
   platformAutomerge: false,
 
-  // Lock file maintenance is created after all other PRs, so with the default
-  // cap of 10 open PRs, unmerged breaking updates could block it.
+  // Lock file maintenance is created after all other PRs. With the default
+  // caps (10 open PRs, 2 new ones per hour) a backlog of breaking updates
+  // could keep it out of its Monday window, all the more because Mend runs
+  // the app only daily until a Renovate PR has been merged.
   prConcurrentLimit: 0,
+  prHourlyLimit: 0,
 }
