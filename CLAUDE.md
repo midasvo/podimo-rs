@@ -129,10 +129,12 @@ of ~10 s MPEG-TS segments with AAC-LC. There is no progressive file upstream.
 `tokens` (5 days), `podcasts` (6 h), `audiobook_meta` (6 h), `audiobook_audio`
 (10 min) and `head` (7 days). Entries live in moka and are mirrored to
 `<CACHE_DIR>/<name>/<key>.json`, loaded lazily on first read. Expired entries
-stay on disk: `get` skips them, `get_stale` returns them too. When every HEAD
-attempt fails (a timeout or connection error; any HTTP response counts as an
-answer), `url_head_info` returns the expired `head` entry, since a stale size
-beats a failed probe. `STORE_TOKENS_ON_DISK=false` keeps tokens in memory only.
+stay on disk: `get` skips them, `get_stale` returns them too. `url_head_info`
+caches only 2xx answers. It retries a 5xx like a timeout or connection error,
+but not another error status. When the probe fails it returns the expired
+`head` entry, since a stale size beats a failed probe. Without one, an error
+status gives length `0` (not cached) and no answer at all an error.
+`STORE_TOKENS_ON_DISK=false` keeps tokens in memory only.
 Startup deletes the bincode files that 1.2.0 and earlier left in
 `<CACHE_DIR>/*_cache/`.
 

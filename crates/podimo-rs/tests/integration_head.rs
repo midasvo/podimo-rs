@@ -195,3 +195,92 @@ async fn expired_entry_is_replaced_by_a_successful_probe() {
     let cached = cache.get("ep-expired").await.expect("a fresh entry");
     assert_eq!(cached.content_length, "9876");
 }
+
+/// Answers HEAD `/x.mp3` with `status` and a 19-byte error page.
+fn error_page(status: u16) -> ResponseTemplate {
+    ResponseTemplate::new(status)
+        .insert_header("Content-Type", "text/plain")
+        .set_body_string("Service Unavailable")
+}
+
+#[tokio::test]
+async fn server_error_is_retried_and_never_cached_as_a_size() {
+    let server = MockServer::start().await;
+    // Three attempts get the error page, then the CDN recovers.
+    Mock::given(method("HEAD"))
+        .and(path("/x.mp3"))
+        .respond_with(error_page(503))
+        .up_to_n_times(3)
+        .with_priority(1)
+        .expect(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path("/x.mp3"))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "9876"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache = empty_head_cache().await;
+    let url = format!("{}/x.mp3", server.uri());
+
+    let info = url_head_info(&Client::new(), &cache, "ep-503", &url, "nl-NL")
+        .await
+        .expect("an unknown length rather than an error");
+    assert_eq!(info.content_length, "0", "not the error page's length");
+    assert_eq!(info.content_type, "audio/mpeg", "not the error page's type");
+    assert!(cache.get("ep-503").await.is_none(), "nothing cached");
+
+    // So the next feed request probes again, and gets the real size.
+    let info = url_head_info(&Client::new(), &cache, "ep-503", &url, "nl-NL")
+        .await
+        .expect("HEAD");
+    assert_eq!(info.content_length, "9876");
+}
+
+#[tokio::test]
+async fn client_error_is_not_retried_or_cached() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/x.mp3"))
+        .respond_with(error_page(403))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache = empty_head_cache().await;
+
+    let info = url_head_info(
+        &Client::new(),
+        &cache,
+        "ep-403",
+        &format!("{}/x.mp3", server.uri()),
+        "nl-NL",
+    )
+    .await
+    .expect("an unknown length rather than an error");
+    assert_eq!(info.content_length, "0");
+    assert!(cache.get("ep-403").await.is_none(), "nothing cached");
+}
+
+#[tokio::test]
+async fn expired_entry_beats_an_error_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/x.mp3"))
+        .respond_with(error_page(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache = head_cache_with_expired("ep-gone", "42").await;
+
+    let info = url_head_info(
+        &Client::new(),
+        &cache,
+        "ep-gone",
+        &format!("{}/x.mp3", server.uri()),
+        "nl-NL",
+    )
+    .await
+    .expect("the expired entry");
+    assert_eq!(info.content_length, "42");
+}
