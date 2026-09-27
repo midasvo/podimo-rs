@@ -2,9 +2,9 @@
 //!
 //! Five caches:
 //!   - `tokens`           — login token by `sha256(username~password)`. Optionally persisted to disk.
-//!   - `podcasts`         — full episode list per podcast id, JSON value. Persisted.
-//!   - `audiobook_meta`   — `audiobookById` metadata payload per audiobook id. Persisted.
-//!   - `audiobook_audio`  — short-lived signed audio URL per audiobook id. Persisted; short TTL.
+//!   - `podcasts`         — episode list per account and podcast id (see `get_podcasts`), JSON value. Persisted.
+//!   - `audiobook_meta`   — `audiobookById` metadata payload per account and audiobook id. Persisted.
+//!   - `audiobook_audio`  — short-lived signed audio URL per account and audiobook id. Persisted; short TTL.
 //!   - `head`             — `(content_length, content_type)` per episode/audiobook id. Persisted.
 //!
 //! Disk format: one JSON file per entry under `<cache_dir>/<name>/<key>.json`,
