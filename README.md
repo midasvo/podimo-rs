@@ -1,45 +1,34 @@
 # podimo-rs
 
-Self-hosted proxy that turns your [Podimo](https://podimo.com) shows and
-audiobooks into regular RSS feeds, so you can listen in any podcast app or in
-Audiobookshelf. A Rust rewrite of [ThijsRay/podimo](https://github.com/ThijsRay/podimo).
+An unofficial podcast and audiobook proxy for Podimo, written in Rust.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots-dark.webp">
-  <img src="docs/screenshots-light.webp" alt="The web form, the feed URL it generates, and the optional audiobook library">
-</picture>
+It exposes your subscribed podcasts as standard RSS feeds (so you can listen in
+AntennaPod, Apple Podcasts, Pocket Casts, etc.) and can sync your audiobooks to
+disk in a layout [Audiobookshelf](https://www.audiobookshelf.org/) understands.
 
-## Quick start
-
-```sh
-docker run -d --name podimo -p 12104:12104 \
-  -e PODIMO_BIND_HOST=0.0.0.0:12104 \
-  -e CACHE_DIR=/app/cache -v "$PWD/cache:/app/cache" \
-  ghcr.io/midasvo/podimo-rs:latest
-```
-
-Open <http://localhost:12104>, enter your Podimo login and a show or audiobook
-URL, and subscribe to the feed URL it gives you.
-
-Images are published to `ghcr.io/midasvo/podimo-rs` for linux/amd64 and
-linux/arm64: `latest` follows `main`, releases are tagged `X.Y.Z` and `X.Y`.
-
-With Docker Compose:
+## Quick start with Docker
 
 ```yaml
 services:
   podimo:
     image: ghcr.io/midasvo/podimo-rs:latest
+    container_name: podimo-rs
     restart: unless-stopped
-    ports: ["12104:12104"]
+    ports:
+      - "3000:3000"
     environment:
-      PODIMO_BIND_HOST: 0.0.0.0:12104
-      PODIMO_HOSTNAME: podimo.example.com # public address shown by the web form
-      PODIMO_PROTOCOL: https
-      CACHE_DIR: /app/cache
+      - PODIMO_ACCESS_TOKEN=your_token_here
+      - PODIMO_REFRESH_TOKEN=your_refresh_token_here
+      # Or:
+      # - PODIMO_USERNAME=you@example.com
+      # - PODIMO_PASSWORD=your_password
     volumes:
-      - ./cache:/app/cache
+      - ./data/cache:/cache
+      - ./data/audiobooks:/audiobooks   # optional, for the audiobook library
 ```
+
+Navigate to `http://localhost:3000/setup` to get your tokens, or open
+`http://localhost:3000` to build feed URLs.
 
 ## How it works
 
@@ -55,8 +44,11 @@ services:
 Podimo streams episode audio as HLS, which podcast apps can't download. The
 proxy fetches the stream and serves each episode as one file with
 [ffmpeg](https://ffmpeg.org). By default that's an `.m4a` with Podimo's own AAC
-audio, repackaged without re-encoding. Set `STREAM_FORMAT=mp3` to get 128 kbps
-MP3 instead, which costs about one CPU core per download. At most 16 episodes
+audio, repackaged without re-encoding. The proxy fetches the whole episode
+before it responds (a few seconds), so apps can seek and resume. Finished files
+stay in the system temp directory for an hour after their last use, 2 GB at
+most. Set `STREAM_FORMAT=mp3` to get 128 kbps MP3 instead, which is streamed
+while it's encoded and costs about one CPU core per download. At most 16 episodes
 download at once, 4 of them as MP3; further requests get `503 Service
 Unavailable` with `Retry-After`.
 
@@ -70,64 +62,44 @@ on the same network (`http://podimo`).
 `STREAM_LINKS_FROM_REQUEST=false` so episode links always use
 `PODIMO_PROTOCOL://PODIMO_HOSTNAME`.
 
-**Logging in**: by default your credentials are part of the feed URL (HTTP Basic
-auth, username `email,region,locale`), so several people can share an instance.
-For a personal instance, set `LOCAL_CREDENTIALS=true` with `PODIMO_EMAIL` and
-`PODIMO_PASSWORD`; feed URLs then contain no credentials.
+## Authentication
+
+Podimo requires an active subscription. Three ways to authenticate:
+
+1. **Tokens in `.env` (recommended)**: set `PODIMO_ACCESS_TOKEN` and
+   `PODIMO_REFRESH_TOKEN`.
+2. **Credentials in `.env`**: set `PODIMO_USERNAME` and `PODIMO_PASSWORD`.
+   Tokens are fetched at startup and refreshed as needed.
+3. **HTTP Basic auth per request**: `http://user:pass@localhost:3000/...` or
+   pass an access token as the password. Ideal for shared instances where users
+   have their own accounts.
 
 ## Configuration
 
-Set environment variables or put them in a `.env` file. All options and their
-defaults are in [`.env.example`](.env.example). The ones you're most likely to
-need:
+All configuration is done via environment variables (or `.env` file):
 
-| Variable | Default | |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `PODIMO_BIND_HOST` | `127.0.0.1:12104` | Listen address. Use `0.0.0.0:12104` in a container. |
-| `PODIMO_HOSTNAME`, `PODIMO_PROTOCOL` | `localhost:12104`, `http` | Public address used in the feed URLs the web form shows. |
-| `STREAM_FORMAT` | `m4a` | Episode files: `m4a` (original quality, almost no CPU) or `mp3` (plays everywhere, re-encoded). |
-| `LOCAL_CREDENTIALS` | `false` | Personal instance: take the login from `PODIMO_EMAIL` and `PODIMO_PASSWORD`. |
-| `CACHE_DIR` | `./cache` | Cached login tokens and episode lists. |
-| `SCRAPER_API`, `ZENROWS_API`, `HTTP_PROXY` | – | Proxy for Podimo's API. Needed when Cloudflare blocks your IP, which is common from data centers. |
-| `ENABLE_LIBRARY` | `false` | Download audiobooks to `LIBRARY_DIR` in an Audiobookshelf-compatible layout. Requires `LOCAL_CREDENTIALS=true`. |
-
-Login tokens give full access to a Podimo account. They are cached on disk
-unless `STORE_TOKENS_ON_DISK=false`; delete `CACHE_DIR` to forget them.
-Passwords are never logged.
-
-To take feeds offline, list podcast IDs in a `.block-list` file; matching feeds
-return `410 Gone`, whatever the case or percent-encoding of the URL. Episode
-links that podcatchers already have keep working unless you list their episode
-IDs too (see [`.block-list.example`](.block-list.example)).
-
-## Development
-
-Requires Rust and, for episode conversion and its tests, `ffmpeg` on `PATH`.
-
-```sh
-cp .env.example .env
-cargo run --bin podimo-rs
-cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --all --locked
-```
+| `PODIMO_PORT` | `3000` | Port to listen on. |
+| `PODIMO_HOSTNAME` | `localhost:3000` | Fallback hostname when no `Host` header is present. |
+| `PODIMO_PROTOCOL` | `http` | Fallback protocol (`http` or `https`). |
+| `STREAM_LINKS_FROM_REQUEST` | `true` | Derive stream links from incoming feed request host/proto. Set `false` behind proxies that alter Host. |
+| `STREAM_FORMAT` | `m4a` | Enclosure format in feeds: `m4a` (AAC, seekable, default) or `mp3` (re-encoded 128 kbps). |
+| `PUBLIC_FEEDS` | `false` | If `true`, feeds are served without auth (uses `.env` credentials). |
+| `ENABLE_LIBRARY` | `false` | Enables the `/library` audiobook management UI. |
+| `LOCAL_CREDENTIALS` | `false` | Must be `true` to use `/setup` and `/library`. |
+| `LIBRARY_DIR` | `/audiobooks` | Where audiobooks are stored. |
+| `CACHE_DIR` | `/cache` | Where metadata and tokens are cached. |
+| `BLOCK_LIST_FILE` | None | Path to a plain text file of podcast IDs/slugs to block (one per line). |
+| `SCRAPER_API` | None | ScraperAPI key for proxying requests. |
+| `ZENROWS_API` | None | ZenRows API key for proxying requests. |
+| `HTTP_PROXY` | None | Standard HTTP proxy URL. |
+| `PODCAST_CACHE_TIME` | `21600` (6h) | Episode metadata cache TTL in seconds. |
+| `AUDIOBOOK_META_CACHE_TIME` | `21600` (6h) | Audiobook metadata cache TTL in seconds. |
+| `AUDIOBOOK_AUDIO_CACHE_TIME` | `600` (10m) | Audiobook audio URL cache TTL in seconds. |
+| `URL_HEAD_CACHE_TIME` | `604800` (7d) | HEAD response file size cache TTL in seconds. |
+| `DEBUG` | `false` | Enables verbose debug logging. |
 
 ## License
 
-EUPL-1.2.
-
-```
-Copyright 2022-2023 Thijs Raymakers
-Copyright 2025-2026 Midas van Oene
-
-Licensed under the EUPL, Version 1.2 or – as soon they will be approved by
-the European Commission - subsequent versions of the EUPL (the "Licence");
-You may not use this work except in compliance with the Licence.
-You may obtain a copy of the Licence at:
-
-https://joinup.ec.europa.eu/software/page/eupl
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the Licence is distributed on an "AS IS" basis,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the Licence for the specific language governing permissions and
-limitations under the Licence.
-```
+MIT
