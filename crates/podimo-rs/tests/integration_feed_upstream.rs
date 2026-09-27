@@ -35,6 +35,8 @@ fn make_config(graphql_url: String) -> Config {
         local_credentials: false,
         podimo_email: None,
         podimo_password: None,
+        podimo_region: "nl".into(),
+        podimo_locale: "nl-NL".into(),
         store_tokens_on_disk: false,
         token_cache_time: 60,
         podcast_cache_time: 60,
@@ -178,6 +180,7 @@ async fn happy_path_returns_rss() {
         "text/xml",
         "feed must be served as text/xml"
     );
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "max-age=900");
     let body = resp.text().await.unwrap();
     assert!(body.contains("<rss"));
     assert!(body.contains("<title>Test Show</title>"));
@@ -742,5 +745,64 @@ async fn a_cached_token_upstream_rejects_is_dropped() {
         "so the next one logs in"
     );
     assert_eq!(logins.load(Ordering::SeqCst), 1);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn local_credentials_log_in_with_the_configured_region_and_locale() {
+    let server = MockServer::start().await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            if body["query"]
+                .as_str()
+                .unwrap_or("")
+                .contains("AuthorizationPreregisterUser")
+            {
+                let locale = req.headers.get("user-locale").and_then(|v| v.to_str().ok());
+                record.lock().unwrap().push(format!(
+                    "{} {}",
+                    body["variables"]["countryCode"].as_str().unwrap_or("?"),
+                    locale.unwrap_or("?"),
+                ));
+            }
+            login_response(&body).unwrap_or_else(|| {
+                ResponseTemplate::new(200).set_body_json(fake_episodes_payload())
+            })
+        })
+        .mount(&server)
+        .await;
+
+    let mut config = make_config(format!("{}/graphql", server.uri()));
+    config.local_credentials = true;
+    config.podimo_email = Some("a@b.com".into());
+    config.podimo_password = Some("pw".into());
+    config.podimo_region = "de".into();
+    config.podimo_locale = "de-DE".into();
+    let state = AppState::new(config).await.unwrap();
+    state
+        .caches
+        .head
+        .insert(
+            "ep1".to_string(),
+            HeadInfo {
+                content_length: "9876".into(),
+                content_type: "audio/mpeg".into(),
+            },
+        )
+        .await;
+    let (addr, handle) = boot_with_state(state).await;
+
+    // No `?region=` or `?locale=`: the configured ones apply.
+    let resp = http_client()
+        .get(format!("http://{addr}/feed/{PODCAST_ID}.xml"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(*seen.lock().unwrap(), ["de de-DE"]);
     handle.abort();
 }

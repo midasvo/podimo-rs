@@ -77,6 +77,13 @@ crates/podimo-rs/tests/       integration tests; Podimo is mocked with wiremock
 3. `rss::podcasts_to_rss` renders the feed. HLS episodes link to `/stream`
    (below); other enclosures are HEAD-probed for their size.
 
+With `LOCAL_CREDENTIALS=true`, feeds log in with `PODIMO_REGION` and
+`PODIMO_LOCALE` (default `nl`, `nl-NL`; an unknown value fails startup)
+unless the URL has `?region=` / `?locale=`. `middleware.rs` adds CORS and
+`Cache-Control: max-age=900` to 2xx GET/HEAD responses on `/feed`,
+`/audiobook` and `/stream`; everything else, the HTML pages included, is
+`no-store`.
+
 ## HLS episodes
 
 Podimo's `streamMedia.url` is a signed master playlist: 192k and 320k variants
@@ -134,7 +141,9 @@ of ~10 s MPEG-TS segments with AAC-LC. There is no progressive file upstream.
   layout: `<Title>.mp3`, `cover.jpg`, `metadata.json`, plus our
   `podimo-state.json`. Downloads interrupted by a restart come back as failed
   and can be retried from `/library`. It never overwrites or deletes files it
-  didn't create.
+  didn't create. It logs in with `PODIMO_REGION` / `PODIMO_LOCALE`, takes a
+  bare UUID on its form as an audiobook, and cuts directory and file names to
+  200 bytes (not characters) on a character boundary.
 - `/setup` shows library diagnostics on every instance, but its path probe
   (`POST /setup/test-path`, and the `LIBRARY_DIR` check on the page) writes a
   file and has no auth, so it only runs with `LOCAL_CREDENTIALS=true`.

@@ -189,8 +189,12 @@ async fn handle_add(State(state): State<AppState>, Form(form): Form<AddForm>) ->
         Err(r) => return r,
     };
 
-    let (kind, audiobook_id) = match parse_podimo_input(&form.url_or_id) {
-        Some((PodimoKind::Audiobook, id)) => (PodimoKind::Audiobook, id.to_string()),
+    let input = form.url_or_id.trim();
+    let audiobook_id = match parse_podimo_input(input) {
+        Some((PodimoKind::Audiobook, id)) => id.to_string(),
+        // A bare UUID says nothing about its kind; on this page it's an
+        // audiobook. `parse_podimo_input` calls it a podcast for the home page.
+        Some((PodimoKind::Podcast, id)) if id == input => id.to_string(),
         Some((PodimoKind::Podcast, _)) => {
             return render_index_with_error(
                 &state,
@@ -206,7 +210,6 @@ async fn handle_add(State(state): State<AppState>, Form(form): Form<AddForm>) ->
             .await;
         }
     };
-    let _ = kind; // already pattern-matched
 
     if !PODCAST_ID_RE.is_match(&audiobook_id) {
         return render_index_with_error(&state, "Invalid audiobook id format.").await;
@@ -278,9 +281,8 @@ async fn library_client(state: &AppState) -> Result<Authorized, String> {
         .as_deref()
         .ok_or_else(|| "PODIMO_PASSWORD is unset — library cannot fetch books.".to_string())?;
 
-    let region = "nl";
-    let locale = "nl-NL";
-    let mut client = PodimoClient::new(email, password, region, locale)
+    let locale = &state.config.podimo_locale;
+    let mut client = PodimoClient::new(email, password, &state.config.podimo_region, locale)
         .map_err(|err| format!("Credentials invalid: {err}"))?;
 
     let cached_token = state.caches.tokens.get(&client.key).await;

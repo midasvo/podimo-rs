@@ -28,6 +28,10 @@ pub struct Config {
     pub local_credentials: bool,
     pub podimo_email: Option<String>,
     pub podimo_password: Option<String>,
+    /// Region and locale that `PODIMO_EMAIL` logs in with: always for the
+    /// library, and for feeds unless `?region=` / `?locale=` say otherwise.
+    pub podimo_region: String,
+    pub podimo_locale: String,
 
     pub store_tokens_on_disk: bool,
     pub token_cache_time: u64,
@@ -84,6 +88,8 @@ impl Config {
             local_credentials: env_bool("LOCAL_CREDENTIALS", false),
             podimo_email: env_opt("PODIMO_EMAIL"),
             podimo_password: env_opt("PODIMO_PASSWORD"),
+            podimo_region: known_region(env_or("PODIMO_REGION", "nl"))?,
+            podimo_locale: known_locale(env_or("PODIMO_LOCALE", "nl-NL"))?,
 
             store_tokens_on_disk: env_bool("STORE_TOKENS_ON_DISK", true),
             token_cache_time: env_u64("TOKEN_CACHE_TIME", 3600 * 24 * 5),
@@ -113,6 +119,7 @@ impl Config {
         }
         tracing::info!(target: "podimo", "DEBUG: {}", self.debug);
         tracing::info!(target: "podimo", "LOCAL_CREDENTIALS: {} ({:?})", self.local_credentials, self.podimo_email);
+        tracing::info!(target: "podimo", "PODIMO_REGION: {}, PODIMO_LOCALE: {}", self.podimo_region, self.podimo_locale);
         tracing::info!(target: "podimo", "PODIMO_HOSTNAME: {}", self.hostname);
         tracing::info!(target: "podimo", "PODIMO_BIND_HOST: {}", self.bind_host);
         tracing::info!(target: "podimo", "PODIMO_PROTOCOL: {}", self.protocol);
@@ -158,6 +165,32 @@ fn env_stream_format() -> anyhow::Result<StreamFormat> {
         .ok_or_else(|| anyhow::anyhow!("STREAM_FORMAT must be `mp3` or `m4a`, got `{value}`"))
 }
 
+/// `PODIMO_REGION`, which fails startup when unknown, like `STREAM_FORMAT`:
+/// logging in to the wrong country would only show as missing content.
+fn known_region(value: String) -> anyhow::Result<String> {
+    let value = value.trim().to_string();
+    if is_known_region(&value) {
+        return Ok(value);
+    }
+    let known: Vec<&str> = REGIONS.iter().map(|(code, _)| *code).collect();
+    anyhow::bail!(
+        "PODIMO_REGION must be one of {}, got `{value}`",
+        known.join(", ")
+    )
+}
+
+/// `PODIMO_LOCALE`, checked like [`known_region`].
+fn known_locale(value: String) -> anyhow::Result<String> {
+    let value = value.trim().to_string();
+    if is_known_locale(&value) {
+        return Ok(value);
+    }
+    anyhow::bail!(
+        "PODIMO_LOCALE must be one of {}, got `{value}`",
+        LOCALES.join(", ")
+    )
+}
+
 fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key)
         .ok()
@@ -188,4 +221,27 @@ pub fn is_known_region(code: &str) -> bool {
 
 pub fn is_known_locale(code: &str) -> bool {
     LOCALES.contains(&code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_and_locale_must_be_known() {
+        assert_eq!(known_region("de".into()).unwrap(), "de");
+        assert_eq!(known_region(" uk ".into()).unwrap(), "uk");
+        let err = known_region("xx".into()).unwrap_err().to_string();
+        assert!(
+            err.contains("PODIMO_REGION") && err.contains("`xx`"),
+            "{err}"
+        );
+
+        assert_eq!(known_locale("de-DE".into()).unwrap(), "de-DE");
+        let err = known_locale("de_DE".into()).unwrap_err().to_string();
+        assert!(
+            err.contains("PODIMO_LOCALE") && err.contains("`de_DE`"),
+            "{err}"
+        );
+    }
 }

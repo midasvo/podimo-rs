@@ -31,6 +31,8 @@ fn make_test_config(library_dir: String) -> Config {
         local_credentials: true,
         podimo_email: Some("a@b.com".into()),
         podimo_password: Some("pw".into()),
+        podimo_region: "nl".into(),
+        podimo_locale: "nl-NL".into(),
         store_tokens_on_disk: false,
         token_cache_time: 60,
         podcast_cache_time: 60,
@@ -725,5 +727,34 @@ async fn add_drops_a_cached_token_upstream_rejects() {
         .contains("fetch audiobook metadata"));
     assert_eq!(state.caches.tokens.get(&key).await, None);
     assert!(state.library.as_ref().unwrap().list().await.is_empty());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn add_takes_a_bare_uuid_as_an_audiobook() {
+    // The home page reads a bare UUID as a podcast; the library page asks for
+    // an "Audiobook URL or UUID", so there it must mean an audiobook. The
+    // mock fails every call, so the flow stops at login.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let config = make_test_config_with_graphql_url(dir, format!("{}/graphql", server.uri()));
+    let (addr, handle, _state) = boot_with_config(config).await;
+
+    let resp = http_client()
+        .post(format!("http://{addr}/library/add"))
+        .form(&[("url_or_id", " fefa939e-c84d-4c16-8bbf-9575e1379d81 ")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(!body.contains("looks like a podcast"), "{body}");
+    assert!(body.contains("Login failed"), "{body}");
     handle.abort();
 }

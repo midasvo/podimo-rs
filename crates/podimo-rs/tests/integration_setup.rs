@@ -28,6 +28,8 @@ fn base_config(library_dir: String, enable_library: bool, local_creds: bool) -> 
             None
         },
         podimo_password: if local_creds { Some("pw".into()) } else { None },
+        podimo_region: "nl".into(),
+        podimo_locale: "nl-NL".into(),
         store_tokens_on_disk: false,
         token_cache_time: 60,
         podcast_cache_time: 60,
