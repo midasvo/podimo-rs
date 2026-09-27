@@ -56,7 +56,9 @@ Podimo streams episode audio as HLS, which podcast apps can't download. The
 proxy fetches the stream and serves each episode as one file with
 [ffmpeg](https://ffmpeg.org). By default that's an `.m4a` with Podimo's own AAC
 audio, repackaged without re-encoding. Set `STREAM_FORMAT=mp3` to get 128 kbps
-MP3 instead, which costs about one CPU core per download.
+MP3 instead, which costs about one CPU core per download. At most 16 episodes
+download at once, 4 of them as MP3; further requests get `503 Service
+Unavailable` with `Retry-After`.
 
 Episode links use the address the feed was fetched from, so one instance serves
 both your phone (`https://podimo.example.com`) and an Audiobookshelf container
