@@ -132,8 +132,9 @@ of ~10 s MPEG-TS segments with AAC-LC. There is no progressive file upstream.
 - The library (`ENABLE_LIBRARY=true`, requires `LOCAL_CREDENTIALS=true`)\
   downloads books to `LIBRARY_DIR/<Author>/<Title>/` in Audiobookshelf's
   layout: `<Title>.mp3`, `cover.jpg`, `metadata.json`, plus our
-  `podimo-state.json`. Downloads interrupted by a restart come back as failed.
-  It never overwrites or deletes files it didn't create.
+  `podimo-state.json`. Downloads interrupted by a restart come back as failed
+  and can be retried from `/library`. It never overwrites or deletes files it
+  didn't create.
 - `/setup` shows library diagnostics on every instance, but its path probe
   (`POST /setup/test-path`, and the `LIBRARY_DIR` check on the page) writes a
   file and has no auth, so it only runs with `LOCAL_CREDENTIALS=true`.

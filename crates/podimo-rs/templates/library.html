@@ -273,6 +273,11 @@
         {% if book.has_audio %}
         <a class="primary" href="/library/{{ book.id }}/audio.mp3" download>Download .mp3</a>
         {% endif %}
+        {% if book.status == "failed" %}
+        <form action="/library/{{ book.id }}/retry" method="post">
+          <button type="submit" class="primary">Retry</button>
+        </form>
+        {% endif %}
         <form
           action="/library/{{ book.id }}/remove"
           method="post"

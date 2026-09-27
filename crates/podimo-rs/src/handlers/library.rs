@@ -3,6 +3,7 @@
 //! Routes:
 //!   - `GET  /library`                — HTML overview of all entries.
 //!   - `POST /library/add`            — add a book by URL or UUID, triggers download.
+//!   - `POST /library/<id>/retry`     — retry a failed download.
 //!   - `POST /library/<id>/remove`    — drop entry + on-disk files.
 //!   - `GET  /library/<id>/audio.mp3` — streamed download with attachment headers.
 //!   - `GET  /library/<id>/cover.jpg` — cover image.
@@ -34,6 +35,7 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/library", get(render_index))
         .route("/library/add", post(handle_add))
+        .route("/library/{id}/retry", post(handle_retry))
         .route("/library/{id}/remove", post(handle_remove))
         .route("/library/{id}/audio.mp3", get(serve_audio))
         .route("/library/{id}/cover.jpg", get(serve_cover))
@@ -209,70 +211,17 @@ async fn handle_add(State(state): State<AppState>, Form(form): Form<AddForm>) ->
         return render_index_with_error(&state, "Invalid audiobook id format.").await;
     }
 
-    // Single-user library = global creds from env.
-    let email = match state.config.podimo_email.as_deref() {
-        Some(e) => e,
-        None => {
-            return render_index_with_error(
-                &state,
-                "PODIMO_EMAIL is unset — library cannot fetch books.",
-            )
-            .await;
-        }
-    };
-    let password = match state.config.podimo_password.as_deref() {
-        Some(p) => p,
-        None => {
-            return render_index_with_error(
-                &state,
-                "PODIMO_PASSWORD is unset — library cannot fetch books.",
-            )
-            .await;
-        }
-    };
-
-    let region = "nl";
-    let locale = "nl-NL";
-    let mut client = match PodimoClient::new(email, password, region, locale) {
+    let client = match library_client(&state).await {
         Ok(c) => c,
-        Err(err) => {
-            return render_index_with_error(&state, &format!("Credentials invalid: {err}")).await;
-        }
+        Err(err) => return render_index_with_error(&state, &err).await,
     };
-    if let Some(token) = state.caches.tokens.get(&client.key).await {
-        client.token = Some(token);
-    } else {
-        match client.login(&state.scraper, &state.config).await {
-            Ok(token) => state.caches.tokens.insert(client.key.clone(), token).await,
-            Err(err) => {
-                return render_index_with_error(&state, &format!("Login failed: {err}")).await;
-            }
-        }
-    }
 
     // Fetch metadata synchronously so we can populate the library row before
     // kicking off the (potentially long) audio download. Bail early on a bad
     // id rather than persisting an empty entry.
-    let meta = match client
-        .get_audiobook(
-            &state.scraper,
-            &state.config,
-            &audiobook_id,
-            &state.caches.audiobook_meta,
-        )
-        .await
-    {
+    let meta = match fetch_audiobook_meta(&state, &client, &audiobook_id).await {
         Ok(v) => v,
-        Err(err) if err.is_not_found() => {
-            return render_index_with_error(&state, "Audiobook not found upstream.").await;
-        }
-        Err(err) => {
-            return render_index_with_error(
-                &state,
-                &format!("Couldn't fetch audiobook metadata: {err}"),
-            )
-            .await;
-        }
+        Err(err) => return render_index_with_error(&state, &err).await,
     };
 
     if library.contains(&audiobook_id).await {
@@ -289,12 +238,7 @@ async fn handle_add(State(state): State<AppState>, Form(form): Form<AddForm>) ->
         return render_index_with_error(&state, &format!("Library add failed: {err}")).await;
     }
 
-    let cover_url = meta
-        .get("audiobookById")
-        .and_then(|b| b.get("coverImage"))
-        .and_then(|c| c.get("url"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let cover_url = cover_url_from_meta(&meta);
 
     let library_clone = library.clone();
     let scraper_clone = state.scraper.clone();
@@ -313,6 +257,141 @@ async fn handle_add(State(state): State<AppState>, Form(form): Form<AddForm>) ->
         )
         .await;
     });
+
+    Redirect::to("/library").into_response()
+}
+
+/// Build a logged-in `PodimoClient` from the single-user library's env
+/// credentials (`PODIMO_EMAIL` / `PODIMO_PASSWORD`), reusing a cached token
+/// when we have one. Shared by `handle_add` and `handle_retry`; the error is
+/// the message to show on the page.
+async fn library_client(state: &AppState) -> Result<PodimoClient, String> {
+    let email = state
+        .config
+        .podimo_email
+        .as_deref()
+        .ok_or_else(|| "PODIMO_EMAIL is unset — library cannot fetch books.".to_string())?;
+    let password = state
+        .config
+        .podimo_password
+        .as_deref()
+        .ok_or_else(|| "PODIMO_PASSWORD is unset — library cannot fetch books.".to_string())?;
+
+    let region = "nl";
+    let locale = "nl-NL";
+    let mut client = PodimoClient::new(email, password, region, locale)
+        .map_err(|err| format!("Credentials invalid: {err}"))?;
+
+    if let Some(token) = state.caches.tokens.get(&client.key).await {
+        client.token = Some(token);
+    } else {
+        match client.login(&state.scraper, &state.config).await {
+            Ok(token) => state.caches.tokens.insert(client.key.clone(), token).await,
+            Err(err) => return Err(format!("Login failed: {err}")),
+        }
+    }
+    Ok(client)
+}
+
+/// Fetch `audiobookById` metadata for `audiobook_id`, translating client
+/// errors into the same user-facing messages the library has always shown.
+/// Shared by `handle_add` and `handle_retry`.
+async fn fetch_audiobook_meta(
+    state: &AppState,
+    client: &PodimoClient,
+    audiobook_id: &str,
+) -> Result<Arc<Value>, String> {
+    client
+        .get_audiobook(
+            &state.scraper,
+            &state.config,
+            audiobook_id,
+            &state.caches.audiobook_meta,
+        )
+        .await
+        .map_err(|err| {
+            if err.is_not_found() {
+                "Audiobook not found upstream.".to_string()
+            } else {
+                format!("Couldn't fetch audiobook metadata: {err}")
+            }
+        })
+}
+
+/// Pull `audiobookById.coverImage.url` out of a metadata payload. The signed
+/// cover URL isn't persisted on the library entry, so both a fresh add and a
+/// retry re-fetch metadata and re-extract it from scratch.
+fn cover_url_from_meta(meta: &Value) -> Option<String> {
+    meta.get("audiobookById")
+        .and_then(|b| b.get("coverImage"))
+        .and_then(|c| c.get("url"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+async fn handle_retry(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let library = match library_or_404(&state) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    if !PODCAST_ID_RE.is_match(&id) {
+        return AppError::BadRequest("Invalid id".into()).into_response();
+    }
+    let entry = match library.get(&id).await {
+        Some(e) => e,
+        None => return AppError::NotFound.into_response(),
+    };
+    if !matches!(entry.status, Status::Failed) {
+        // Already queued, downloading, or done — nothing to retry.
+        return Redirect::to("/library").into_response();
+    }
+
+    let client = match library_client(&state).await {
+        Ok(c) => c,
+        Err(err) => return render_index_with_error(&state, &err).await,
+    };
+    let meta = match fetch_audiobook_meta(&state, &client, &id).await {
+        Ok(v) => v,
+        Err(err) => return render_index_with_error(&state, &err).await,
+    };
+    let cover_url = cover_url_from_meta(&meta);
+
+    // Flip Failed -> Queued atomically so two clicks can't start two
+    // downloads writing into the same `.partial` file.
+    let mut restarted = false;
+    if let Err(err) = library
+        .update(&id, |e| {
+            if e.status == Status::Failed {
+                e.status = Status::Queued;
+                e.error = None;
+                e.audio_downloaded_bytes = 0;
+                restarted = true;
+            }
+        })
+        .await
+    {
+        return render_index_with_error(&state, &format!("Library update failed: {err}")).await;
+    }
+
+    if restarted {
+        let library_clone = library.clone();
+        let scraper_clone = state.scraper.clone();
+        let config_clone = Arc::clone(&state.config);
+        let caches_clone = state.caches.clone();
+        let id_clone = id.clone();
+        tokio::spawn(async move {
+            download::run(
+                library_clone,
+                client,
+                scraper_clone,
+                config_clone,
+                caches_clone,
+                id_clone,
+                cover_url,
+            )
+            .await;
+        });
+    }
 
     Redirect::to("/library").into_response()
 }
