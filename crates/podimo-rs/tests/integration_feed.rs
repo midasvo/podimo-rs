@@ -36,6 +36,7 @@ fn make_test_config<F: FnOnce(&mut Config)>(tweak: F) -> Config {
         public_feeds: false,
         graphql_url: "https://example.invalid/graphql".into(),
         stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
+        stream_links_from_request: true,
     };
     tweak(&mut config);
     // Leak the tempdir so the cache dir persists for the test's lifetime.

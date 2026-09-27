@@ -75,12 +75,19 @@ pub(crate) fn parse_basic_auth(headers: &axum::http::HeaderMap) -> Option<(Strin
 
 /// `scheme://host[:port]` this request was addressed to, for absolute links
 /// the same client can follow back. Behind a reverse proxy that's
-/// `X-Forwarded-Proto` + `X-Forwarded-Host` (or the passed-through `Host`);
-/// a direct request is plain HTTP, since we don't terminate TLS ourselves.
-/// Falls back to `fallback` when there's no usable host header. Both headers
+/// `X-Forwarded-Proto` + `X-Forwarded-Host` (or the passed-through `Host`).
+/// Without `X-Forwarded-Proto` the scheme is plain HTTP, since we don't
+/// terminate TLS ourselves, except on the configured public `hostname`: a
+/// client that reached us by that name gets the configured `protocol`, as a
+/// proxy may pass `Host` on without `X-Forwarded-Proto`. Falls back to
+/// `protocol://hostname` when there's no usable host header. Both headers
 /// are client-controlled, but only shape the links in this client's own
 /// response.
-pub(crate) fn request_base_url(headers: &axum::http::HeaderMap, fallback: &str) -> String {
+pub(crate) fn request_base_url(
+    headers: &axum::http::HeaderMap,
+    protocol: &str,
+    hostname: &str,
+) -> String {
     let header = |name: &str| {
         headers
             .get(name)
@@ -94,11 +101,13 @@ pub(crate) fn request_base_url(headers: &axum::http::HeaderMap, fallback: &str) 
         .or_else(|| header("host"))
         .filter(|h| is_plausible_authority(h));
     let Some(host) = host else {
-        return fallback.to_string();
+        return format!("{protocol}://{hostname}");
     };
     let scheme = match header("x-forwarded-proto") {
         Some(proto) if proto.eq_ignore_ascii_case("https") => "https",
-        _ => "http",
+        Some(_) => "http",
+        None if host.eq_ignore_ascii_case(hostname) => protocol,
+        None => "http",
     };
     format!("{scheme}://{host}")
 }
@@ -299,14 +308,17 @@ mod tests {
             .collect()
     }
 
-    const FALLBACK: &str = "https://fallback.example";
+    /// `request_base_url` with `https://fallback.example` configured.
+    fn base_url(h: &axum::http::HeaderMap) -> String {
+        request_base_url(h, "https", "fallback.example")
+    }
 
     #[test]
     fn request_base_url_direct_request_is_plain_http_on_host() {
         let h = headers(&[("host", "podimo")]);
-        assert_eq!(request_base_url(&h, FALLBACK), "http://podimo");
+        assert_eq!(base_url(&h), "http://podimo");
         let h = headers(&[("host", "192.168.1.5:12104")]);
-        assert_eq!(request_base_url(&h, FALLBACK), "http://192.168.1.5:12104");
+        assert_eq!(base_url(&h), "http://192.168.1.5:12104");
     }
 
     #[test]
@@ -315,21 +327,37 @@ mod tests {
             ("host", "podimo.example.com"),
             ("x-forwarded-proto", "https"),
         ]);
-        assert_eq!(request_base_url(&h, FALLBACK), "https://podimo.example.com");
+        assert_eq!(base_url(&h), "https://podimo.example.com");
 
         let h = headers(&[
             ("host", "podimo:12104"),
             ("x-forwarded-host", "podimo.example.com, internal"),
             ("x-forwarded-proto", "HTTPS, http"),
         ]);
-        assert_eq!(request_base_url(&h, FALLBACK), "https://podimo.example.com");
+        assert_eq!(base_url(&h), "https://podimo.example.com");
     }
 
     #[test]
     fn request_base_url_falls_back_without_a_usable_host() {
-        assert_eq!(request_base_url(&headers(&[]), FALLBACK), FALLBACK);
+        assert_eq!(base_url(&headers(&[])), "https://fallback.example");
         let h = headers(&[("host", "evil.example/\"><x")]);
-        assert_eq!(request_base_url(&h, FALLBACK), FALLBACK);
+        assert_eq!(base_url(&h), "https://fallback.example");
+    }
+
+    #[test]
+    fn request_base_url_gives_the_configured_host_the_configured_scheme() {
+        let configured = |h| request_base_url(&h, "https", "podimo.example.com");
+        // A proxy that passes `Host` on but not `X-Forwarded-Proto`.
+        let h = headers(&[("host", "Podimo.Example.com")]);
+        assert_eq!(configured(h), "https://Podimo.Example.com");
+        // In-cluster clients still get plain HTTP on their own host name.
+        assert_eq!(configured(headers(&[("host", "podimo")])), "http://podimo");
+        // An explicit `X-Forwarded-Proto` wins over the configured protocol.
+        let h = headers(&[
+            ("host", "podimo.example.com"),
+            ("x-forwarded-proto", "http"),
+        ]);
+        assert_eq!(configured(h), "http://podimo.example.com");
     }
 
     #[test]

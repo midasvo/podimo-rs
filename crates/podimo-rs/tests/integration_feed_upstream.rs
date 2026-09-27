@@ -44,6 +44,7 @@ fn make_config(graphql_url: String) -> Config {
         public_feeds: false,
         graphql_url,
         stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
+        stream_links_from_request: true,
     }
 }
 
@@ -184,9 +185,12 @@ async fn happy_path_returns_rss() {
     handle.abort();
 }
 
-#[tokio::test]
-async fn stream_links_follow_the_host_the_feed_was_requested_on() {
-    let server = MockServer::start().await;
+/// Mocks a show whose one episode is HLS, so its enclosure is a `/stream`
+/// link, and boots the app with `config` pointed at the mock.
+async fn boot_hls_show(
+    server: &MockServer,
+    config: impl FnOnce(&mut Config),
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let mut payload = fake_episodes_payload();
     let episode = &mut payload["data"]["episodes"][0];
     episode["audio"] = Value::Null;
@@ -194,11 +198,21 @@ async fn stream_links_follow_the_host_the_feed_was_requested_on() {
         "url": "https://media-cdn-episodes.podimo.com/ep1/ep1.m3u8?u=x&Signature=s",
         "duration": 1234
     });
-    install_graphql_mock(&server, ResponseTemplate::new(200).set_body_json(payload)).await;
+    install_graphql_mock(server, ResponseTemplate::new(200).set_body_json(payload)).await;
 
-    let config = make_config(format!("{}/graphql", server.uri()));
-    let state = AppState::new(config).await.unwrap();
-    let (addr, handle) = boot_with_state(state).await;
+    let mut cfg = make_config(format!("{}/graphql", server.uri()));
+    config(&mut cfg);
+    boot_with_state(AppState::new(cfg).await.unwrap()).await
+}
+
+#[tokio::test]
+async fn stream_links_follow_the_host_the_feed_was_requested_on() {
+    let server = MockServer::start().await;
+    let (addr, handle) = boot_hls_show(&server, |c| {
+        c.protocol = "https".into();
+        c.hostname = "podimo.example.com".into();
+    })
+    .await;
 
     let feed = |extra: &'static [(&'static str, &'static str)]| {
         let mut req = http_client()
@@ -220,6 +234,41 @@ async fn stream_links_follow_the_host_the_feed_was_requested_on() {
         ("X-Forwarded-Proto", "https"),
     ])
     .await;
+    assert!(
+        body.contains("url=\"https://podimo.example.com/stream/"),
+        "{body}"
+    );
+
+    // A proxy that passes `Host` on without `X-Forwarded-Proto`: the
+    // configured public host gets the configured scheme.
+    let body = feed(&[("Host", "podimo.example.com")]).await;
+    assert!(
+        body.contains("url=\"https://podimo.example.com/stream/"),
+        "{body}"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn stream_links_can_always_use_the_configured_address() {
+    // For proxies that rewrite `Host`: the test request's own `Host` is
+    // `127.0.0.1:<port>`, which no podcatcher outside could reach.
+    let server = MockServer::start().await;
+    let (addr, handle) = boot_hls_show(&server, |c| {
+        c.stream_links_from_request = false;
+        c.protocol = "https".into();
+        c.hostname = "podimo.example.com".into();
+    })
+    .await;
+    let body = http_client()
+        .get(format!("http://{addr}/feed/{PODCAST_ID}.xml"))
+        .header("Authorization", basic_auth("a@b.com,nl,nl-NL", "pw"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(
         body.contains("url=\"https://podimo.example.com/stream/"),
         "{body}"

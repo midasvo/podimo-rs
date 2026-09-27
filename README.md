@@ -64,6 +64,12 @@ Episode links use the address the feed was fetched from, so one instance serves
 both your phone (`https://podimo.example.com`) and an Audiobookshelf container
 on the same network (`http://podimo`).
 
+**Behind a reverse proxy**, pass the original `Host` header on and set
+`X-Forwarded-Proto` (nginx: `proxy_set_header Host $host;` and
+`proxy_set_header X-Forwarded-Proto $scheme;`). If your proxy can't, set
+`STREAM_LINKS_FROM_REQUEST=false` so episode links always use
+`PODIMO_PROTOCOL://PODIMO_HOSTNAME`.
+
 **Logging in**: by default your credentials are part of the feed URL (HTTP Basic
 auth, username `email,region,locale`), so several people can share an instance.
 For a personal instance, set `LOCAL_CREDENTIALS=true` with `PODIMO_EMAIL` and

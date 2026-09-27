@@ -68,9 +68,15 @@ async fn serve(
 
     // Stream links go back through whatever address this client used for the
     // feed, so an in-cluster client (e.g. `http://podimo`) and one coming in
-    // through the public reverse proxy each get links they can reach.
-    let fallback = format!("{}://{}", state.config.protocol, state.config.hostname);
-    let stream_base_url = request_base_url(&req_headers, &fallback);
+    // through the public reverse proxy each get links they can reach. A proxy
+    // that rewrites `Host` hides that address, hence the setting to always
+    // use the configured one.
+    let config = &state.config;
+    let stream_base_url = if config.stream_links_from_request {
+        request_base_url(&req_headers, &config.protocol, &config.hostname)
+    } else {
+        format!("{}://{}", config.protocol, config.hostname)
+    };
     let stream_links = StreamLinks {
         base_url: &stream_base_url,
         format: state.config.stream_format,

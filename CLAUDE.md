@@ -89,9 +89,11 @@ of ~10 s MPEG-TS segments with AAC-LC. There is no progressive file upstream.
   URL in unpadded base64url, so the link is a plain file path; Audiobookshelf
   picks the file type from the extension. `<base>` comes from the feed request
   (`util::request_base_url`: `X-Forwarded-Proto`/`X-Forwarded-Host`, else
-  `http://` + `Host`), falling back to `PODIMO_PROTOCOL://PODIMO_HOSTNAME`.
+  `Host` over `http`, or over `PODIMO_PROTOCOL` when `Host` is
+  `PODIMO_HOSTNAME`), falling back to `PODIMO_PROTOCOL://PODIMO_HOSTNAME`.
   In-cluster clients thus get `http://podimo/…` and proxied ones the public
-  host.
+  host. `STREAM_LINKS_FROM_REQUEST=false` always uses the configured address,
+  for proxies that rewrite `Host`.
 - `/stream` has no auth, since the signed URL is the credential, but only
   accepts https `.m3u8` URLs on `*.podimo.com`. The variant and segment URLs
   in the playlists, and any redirect target, must be https on `*.podimo.com`
