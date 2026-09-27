@@ -4,6 +4,11 @@ Self-hosted proxy that turns your [Podimo](https://podimo.com) shows and
 audiobooks into regular RSS feeds, so you can listen in any podcast app or in
 Audiobookshelf. A Rust rewrite of [ThijsRay/podimo](https://github.com/ThijsRay/podimo).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots-dark.webp">
+  <img src="docs/screenshots-light.webp" alt="The web form, the feed URL it generates, and the optional audiobook library">
+</picture>
+
 ## Quick start
 
 ```sh
