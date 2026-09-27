@@ -50,6 +50,10 @@ pub struct Config {
     /// repackaged, near-zero CPU) or `mp3` (re-encoded, plays everywhere).
     /// `/stream` serves both either way; this only picks the enclosure.
     pub stream_format: StreamFormat,
+    /// Whether HLS enclosures point at the address the feed was requested on
+    /// (default) or always at `protocol://hostname`. The latter is for
+    /// reverse proxies that rewrite `Host` without `X-Forwarded-Host`.
+    pub stream_links_from_request: bool,
 
     /// Podimo GraphQL endpoint. Overridable via `PODIMO_GRAPHQL_URL` so
     /// integration tests can point at a wiremock server. Defaults to the
@@ -93,6 +97,7 @@ impl Config {
             public_feeds: env_bool("PUBLIC_FEEDS", false),
 
             stream_format: env_stream_format()?,
+            stream_links_from_request: env_bool("STREAM_LINKS_FROM_REQUEST", true),
 
             graphql_url: env_or("PODIMO_GRAPHQL_URL", "https://podimo.com/graphql"),
         })
@@ -113,6 +118,7 @@ impl Config {
         tracing::info!(target: "podimo", "PODIMO_PROTOCOL: {}", self.protocol);
         tracing::info!(target: "podimo", "PUBLIC_FEEDS: {}", self.public_feeds);
         tracing::info!(target: "podimo", "STREAM_FORMAT: {}", self.stream_format.extension());
+        tracing::info!(target: "podimo", "STREAM_LINKS_FROM_REQUEST: {}", self.stream_links_from_request);
         tracing::info!(target: "podimo", "HTTP_PROXY: {:?}", self.http_proxy);
         tracing::info!(target: "podimo", "ZENROWS_API set: {}", self.zenrows_api.is_some());
         tracing::info!(target: "podimo", "SCRAPER_API set: {}", self.scraper_api.is_some());

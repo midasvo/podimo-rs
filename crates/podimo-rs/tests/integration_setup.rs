@@ -38,6 +38,7 @@ fn base_config(library_dir: String, enable_library: bool, local_creds: bool) -> 
         public_feeds: false,
         graphql_url: "https://example.invalid/graphql".into(),
         stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
+        stream_links_from_request: true,
     }
 }
 

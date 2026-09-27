@@ -37,6 +37,7 @@ fn make_test_config(library_dir: String) -> Config {
         public_feeds: false,
         graphql_url: "https://example.invalid/graphql".into(),
         stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
+        stream_links_from_request: true,
     }
 }
 

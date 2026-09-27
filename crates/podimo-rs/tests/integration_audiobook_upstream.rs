@@ -39,6 +39,7 @@ fn make_config(graphql_url: String) -> Config {
         public_feeds: false,
         graphql_url,
         stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
+        stream_links_from_request: true,
     }
 }
 
