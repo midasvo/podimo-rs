@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use once_cell::sync::Lazy;
-use rand::distributions::{Distribution, Uniform};
+use rand::distr::{Distribution, Uniform};
 use rand::seq::IteratorRandom;
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -130,7 +130,7 @@ pub(crate) fn parse_podimo_input(input: &str) -> Option<(PodimoKind, &str)> {
 const HEX_CHARS: &[u8] = b"1234567890abcdef";
 
 pub(crate) fn random_hex_id(length: usize) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..length)
         .map(|_| {
             char::from(
@@ -144,8 +144,9 @@ pub(crate) fn random_hex_id(length: usize) -> String {
 }
 
 pub(crate) fn random_flyer_id() -> String {
-    let mut rng = rand::thread_rng();
-    let dist = Uniform::from(1_000_000_000_000_u64..=9_999_999_999_999_u64);
+    let mut rng = rand::rng();
+    let dist =
+        Uniform::try_from(1_000_000_000_000_u64..=9_999_999_999_999_u64).expect("range not empty");
     let a = dist.sample(&mut rng);
     let b = dist.sample(&mut rng);
     format!("{a}-{b}")
