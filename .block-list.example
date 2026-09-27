@@ -1,9 +1,8 @@
-# This file contains the podfcast ID or the random 10 digit 
-# identifier added to the podcast feed URLs that you wanted blocked.
-# Create a new line for every feed you want to block
+# One entry per line: a podcast ID, or the random 10-character ID in a feed URL.
+# Feeds whose URL contains an entry return 410 Gone. Only the first word of a
+# line counts; lines starting with '#' and empty lines are ignored.
 1234567890
 abcdefghij
 
-# Emptry lines are ignored
-
-# de9b2081-9fc5-489f-b9d3-d744ed9cab20 # Uncheck to block "Man man man, de podcast" ;-)
+# Uncomment to block "Man man man, de podcast":
+# de9b2081-9fc5-489f-b9d3-d744ed9cab20

@@ -1,173 +1,99 @@
-<div align="center">
-
 # podimo-rs
 
-Self-hosted RSS proxy for [Podimo](https://podimo.com). Logs in to your account,
-fetches the episode list for a given show, and serves it as an RSS 2.0 feed your
-podcast player can subscribe to.
+Self-hosted proxy that turns your [Podimo](https://podimo.com) shows and
+audiobooks into regular RSS feeds, so you can listen in any podcast app or in
+Audiobookshelf. A Rust rewrite of [ThijsRay/podimo](https://github.com/ThijsRay/podimo).
 
-Rust rewrite of the original Python service (which was a fork of
-[ThijsRay/podimo](https://github.com/ThijsRay/podimo)). The HTTP contract, config
-surface, and `.block-list` format are preserved.
-
-</div>
-
-## What it does
-
-You point your podcast player at a generated feed URL like
-
-```
-https://you%40example.com,nl,nl-NL:your-password@your-host/feed/<podcast-id>.xml
-```
-
-and it returns RSS 2.0 (with the iTunes namespace) that any normal podcast app
-can consume. The web form at `/` builds those URLs for you.
-
-There are two modes, selected with the `LOCAL_CREDENTIALS` env var:
-
-- **Multi-user (default)** — credentials travel in HTTP Basic on the feed URL,
-  so different users on the same instance see their own subscriptions.
-- **Single-user (`LOCAL_CREDENTIALS=true`)** — credentials come from the host
-  via `PODIMO_EMAIL` / `PODIMO_PASSWORD`. The form omits the email/password
-  inputs. Recommended for self-hosted instances with one user.
-
-## Run with Docker
+## Quick start
 
 ```sh
-docker run --rm \
-    -e PODIMO_BIND_HOST=0.0.0.0:12104 \
-    -p 12104:12104 \
-    -v $(pwd)/cache:/app/cache \
-    -e CACHE_DIR=/app/cache \
-    ghcr.io/midasvo/podimo-rs:latest
+docker run -d --name podimo -p 12104:12104 \
+  -e PODIMO_BIND_HOST=0.0.0.0:12104 \
+  -e CACHE_DIR=/app/cache -v "$PWD/cache:/app/cache" \
+  ghcr.io/midasvo/podimo-rs:latest
 ```
 
-Then visit <http://localhost:12104>.
+Open <http://localhost:12104>, enter your Podimo login and a show or audiobook
+URL, and subscribe to the feed URL it gives you.
 
-Multi-arch images (linux/amd64, linux/arm64) are published from `main` and from
-version tags. See <https://github.com/midasvo/podimo-ce/pkgs/container/podimo-rs>
-for the tag list.
+Images are published to `ghcr.io/midasvo/podimo-rs` for linux/amd64 and
+linux/arm64: `latest` follows `main`, releases are tagged `X.Y.Z` and `X.Y`.
 
-### `docker-compose.yml`
+With Docker Compose:
 
 ```yaml
 services:
   podimo:
     image: ghcr.io/midasvo/podimo-rs:latest
     restart: unless-stopped
-    ports:
-      - "12104:12104"
+    ports: ["12104:12104"]
     environment:
       PODIMO_BIND_HOST: 0.0.0.0:12104
-      PODIMO_HOSTNAME: podimo.example.com
+      PODIMO_HOSTNAME: podimo.example.com # public address shown by the web form
       PODIMO_PROTOCOL: https
-      # LOCAL_CREDENTIALS: "true"
-      # PODIMO_EMAIL: you@example.com
-      # PODIMO_PASSWORD: hunter2
+      CACHE_DIR: /app/cache
     volumes:
       - ./cache:/app/cache
 ```
 
-## Run from source
+## How it works
 
-Requires a Rust toolchain (1.80+). [rustup](https://rustup.rs) is the usual
-install path. Podimo now serves episodes as HLS, which the proxy converts to
-MP3 with [ffmpeg](https://ffmpeg.org), so `ffmpeg` must be on your `PATH`
-too (the Docker image includes it).
+| Route | |
+| --- | --- |
+| `/` | Web form that builds your feed URL. |
+| `/feed/<podcast-id>.xml` | Podcast feed. `?limit=N` keeps only the newest N episodes. |
+| `/audiobook/<audiobook-id>.xml` | Audiobook as a feed with one episode. |
+| `/stream/…/<episode-id>.m4a` or `.mp3` | Episode audio (the feed links here). |
+| `/library` | Optional audiobook library (see configuration). |
+| `/healthz` | Health check. |
 
-```sh
-git clone https://github.com/midasvo/podimo-ce        # repo name is `podimo-ce`; binary is `podimo-rs`
-cd podimo-ce
-cp .env.example .env                                   # edit as needed
-cargo run --release --bin podimo-rs
-```
+Podimo streams episode audio as HLS, which podcast apps can't download. The
+proxy fetches the stream and serves each episode as one file with
+[ffmpeg](https://ffmpeg.org). By default that's an `.m4a` with Podimo's own AAC
+audio, repackaged without re-encoding. Set `STREAM_FORMAT=mp3` to get 128 kbps
+MP3 instead, which costs about one CPU core per download.
 
-The service binds `PODIMO_BIND_HOST` (default `127.0.0.1:12104`).
+Episode links use the address the feed was fetched from, so one instance serves
+both your phone (`https://podimo.example.com`) and an Audiobookshelf container
+on the same network (`http://podimo`).
+
+**Logging in**: by default your credentials are part of the feed URL (HTTP Basic
+auth, username `email,region,locale`), so several people can share an instance.
+For a personal instance, set `LOCAL_CREDENTIALS=true` with `PODIMO_EMAIL` and
+`PODIMO_PASSWORD`; feed URLs then contain no credentials.
 
 ## Configuration
 
-All knobs are env vars; see [`.env.example`](.env.example) for the full list
-with defaults. A `.env` file at the working directory is picked up
-automatically.
+Set environment variables or put them in a `.env` file. All options and their
+defaults are in [`.env.example`](.env.example). The ones you're most likely to
+need:
 
-The high-impact ones:
-
-| Var | Default | Purpose |
+| Variable | Default | |
 | --- | --- | --- |
-| `PODIMO_BIND_HOST` | `127.0.0.1:12104` | Listen address. Set `0.0.0.0:12104` inside containers. |
-| `PODIMO_HOSTNAME` | `localhost:12104` | Hostname shown in generated feed URLs (use your reverse-proxy hostname). |
-| `PODIMO_PROTOCOL` | `http` | Scheme shown in generated URLs (`https` once behind a TLS terminator). |
-| `LOCAL_CREDENTIALS` | `false` | If `true`, read creds from `PODIMO_EMAIL` / `PODIMO_PASSWORD` instead of HTTP Basic. |
-| `CACHE_DIR` | `./cache` | Root for the three on-disk caches (tokens, podcasts, head probes). |
-| `BLOCK_LIST_FILE` | `./.block-list` | One token per line; if any token is a substring of the request URL the feed returns `410`. See `.block-list.example`. |
+| `PODIMO_BIND_HOST` | `127.0.0.1:12104` | Listen address. Use `0.0.0.0:12104` in a container. |
+| `PODIMO_HOSTNAME`, `PODIMO_PROTOCOL` | `localhost:12104`, `http` | Public address used in the feed URLs the web form shows. |
+| `STREAM_FORMAT` | `m4a` | Episode files: `m4a` (original quality, almost no CPU) or `mp3` (plays everywhere, re-encoded). |
+| `LOCAL_CREDENTIALS` | `false` | Personal instance: take the login from `PODIMO_EMAIL` and `PODIMO_PASSWORD`. |
+| `CACHE_DIR` | `./cache` | Cached login tokens and episode lists. |
+| `SCRAPER_API`, `ZENROWS_API`, `HTTP_PROXY` | – | Proxy for Podimo's API. Needed when Cloudflare blocks your IP, which is common from data centers. |
+| `ENABLE_LIBRARY` | `false` | Download audiobooks to `LIBRARY_DIR` in an Audiobookshelf-compatible layout. Requires `LOCAL_CREDENTIALS=true`. |
 
-### Bot-protection bypass
+Login tokens give full access to a Podimo account. They are cached on disk
+unless `STORE_TOKENS_ON_DISK=false`; delete `CACHE_DIR` to forget them.
+Passwords are never logged.
 
-Podimo sits behind Cloudflare. Requests from datacenter IPs (most VPSes) are
-unreliable without one of:
-
-- `SCRAPER_API` — your ScraperAPI key. Requests get URL-rewritten through
-  `api.scraperapi.com`. Free tier at <https://dashboard.scraperapi.com/signup>.
-- `ZENROWS_API` — your ZenRows key. Requests get routed via `api.zenrows.com`.
-  Free trial at <https://app.zenrows.com/register>.
-- `HTTP_PROXY` — a residential HTTPS proxy URL.
-
-Only one of the three needs to be set; they're checked in that order. A
-residential IP (e.g. self-hosting from home) usually doesn't need any of them.
-
-## Endpoints
-
-| Path | Method | Body |
-| --- | --- | --- |
-| `/` | GET, POST | HTML form for building feed URLs. POST validates input and renders the resulting URL. |
-| `/feed/<podcast_id>.xml` | GET | RSS 2.0 feed. HTTP Basic auth in multi-user mode; env-var creds in single-user mode. |
-| `/healthz` | GET | `200 {"status":"ok"}` with `Cache-Control: no-store`. Container HEALTHCHECK target. |
-
-Caching policy:
-
-- `/healthz` is never cached.
-- 2xx responses get `Cache-Control: max-age=900`.
-- Everything else (401, 4xx, 5xx) gets `Cache-Control: no-store` — prevents
-  upstream blips from stickying through CDNs.
-
-CORS is scoped to `GET`/`HEAD` of `/feed/*` so podcast clients can fetch
-cross-origin without exposing the form's POST endpoint to other origins.
-
-## Block list
-
-Drop a `.block-list` file next to the service (or point `BLOCK_LIST_FILE` at
-one elsewhere). One token per line; `#` starts a comment; only the first
-whitespace-separated token of each line is used. Any line whose token appears
-anywhere in the request URL returns `410 GONE`. Tokens can be podcast IDs or
-the random 10-character cache-buster the form generates. See
-[`.block-list.example`](.block-list.example).
-
-## Privacy
-
-What lives in memory (or on disk under `CACHE_DIR` when `STORE_TOKENS_ON_DISK`
-is true, which is the default):
-
-- Your email + password — only used to obtain a Podimo access token; never
-  written to logs.
-- `sha256("<email>~<password>")` — used as the cache key for your access token.
-- The Podimo access token itself.
-
-The token cache defaults to a 5-day TTL. Wipe `CACHE_DIR` to forget everything.
+To take feeds offline, list podcast IDs in a `.block-list` file; matching feeds
+return `410 Gone` (see [`.block-list.example`](.block-list.example)).
 
 ## Development
 
+Requires Rust and, for episode conversion and its tests, `ffmpeg` on `PATH`.
+
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all --locked
-
-docker build -t podimo-rs:test .
-docker run --rm -p 12104:12104 podimo-rs:test
-curl http://127.0.0.1:12104/healthz   # → 200 {"status":"ok"}
+cp .env.example .env
+cargo run --bin podimo-rs
+cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --all --locked
 ```
-
-CI runs the same three commands on every push and PR. The Docker image is
-published from `main` and version tags.
 
 ## License
 
