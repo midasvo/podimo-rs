@@ -22,7 +22,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::ReaderStream;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -31,17 +31,25 @@ pub const AAC_CONTENT_TYPE: &str = "audio/aac";
 
 /// Looked up on `PATH`; the Docker image installs Debian's ffmpeg.
 const FFMPEG: &str = "ffmpeg";
-/// Simultaneous MP3 encodes; further requests wait for a free slot. M4A only
+/// Simultaneous `/stream` responses of any format. Each one holds an ffmpeg
+/// process (except the legacy .aac route) and a few upstream connections.
+/// M4A is a stream copy, so this can be well above the MP3 limit.
+const MAX_CONCURRENT_STREAMS: usize = 16;
+/// Simultaneous MP3 encodes, each on top of a stream slot. M4A only
 /// repackages and doesn't take one.
 const MAX_CONCURRENT_TRANSCODES: usize = 4;
+/// How long a request waits for a free slot before it gets a 503.
+const SLOT_WAIT: Duration = Duration::from_secs(10);
 /// How much of ffmpeg's stderr to keep for the error message.
 const STDERR_TAIL_BYTES: usize = 2048;
 
+static STREAM_SLOTS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)));
 static TRANSCODE_SLOTS: Lazy<Arc<Semaphore>> =
     Lazy::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSCODES)));
 
-/// Only playlists on Podimo's own hosts are proxied, so `/stream` can't be
-/// abused as an open relay.
+/// Only playlists, segments and redirects on Podimo's own hosts are fetched,
+/// so `/stream` can't be abused as an open relay.
 const ALLOWED_HOST_SUFFIX: &str = ".podimo.com";
 
 /// Segments fetched ahead of the one currently being written to the client.
@@ -67,6 +75,8 @@ pub enum HlsError {
     Demux(&'static str),
     #[error("transcode: {0}")]
     Transcode(String),
+    #[error("all stream slots are busy")]
+    Busy,
 }
 
 /// What `/stream/<token>/<id>.<ext>` hands out. Both are always served; the
@@ -183,6 +193,15 @@ pub fn decode_source_token(token: &str) -> Result<String, HlsError> {
 /// Parse and vet the `src` query parameter of a `/stream` request.
 pub fn validate_source(src: &str) -> Result<Url, HlsError> {
     let url = Url::parse(src).map_err(|_| HlsError::InvalidSource("not a URL"))?;
+    check_podimo_https(&url)?;
+    if !is_hls_url(src) {
+        return Err(HlsError::InvalidSource("not an .m3u8 playlist"));
+    }
+    Ok(url)
+}
+
+/// Every URL `/stream` fetches must be https on one of Podimo's hosts.
+fn check_podimo_https(url: &Url) -> Result<(), HlsError> {
     if url.scheme() != "https" {
         return Err(HlsError::InvalidSource("must be https"));
     }
@@ -190,10 +209,7 @@ pub fn validate_source(src: &str) -> Result<Url, HlsError> {
     if !host.ends_with(ALLOWED_HOST_SUFFIX) {
         return Err(HlsError::InvalidSource("host not allowed"));
     }
-    if !is_hls_url(src) {
-        return Err(HlsError::InvalidSource("not an .m3u8 playlist"));
-    }
-    Ok(url)
+    Ok(())
 }
 
 /// Fetch the playlist at `src` and return the segment URLs of its
@@ -232,7 +248,7 @@ pub fn select_variant(text: &str, base: &Url) -> Result<Option<Url>, HlsError> {
             }
         }
     }
-    best.map(|(_, uri)| join(base, uri)).transpose()
+    best.map(|(_, uri)| resolve_entry(base, uri)).transpose()
 }
 
 /// Segment URLs of a media playlist, resolved against `base`.
@@ -250,7 +266,7 @@ pub fn media_segments(text: &str, base: &Url) -> Result<Vec<Url>, HlsError> {
         } else if line.starts_with("#EXT-X-MAP:") {
             return Err(HlsError::Unsupported("fragmented MP4 segments".into()));
         } else if !line.is_empty() && !line.starts_with('#') {
-            segments.push(join(base, line)?);
+            segments.push(resolve_entry(base, line)?);
         }
     }
     Ok(segments)
@@ -279,7 +295,9 @@ pub fn aac_stream(
 }
 
 /// Turn an ADTS AAC stream into `format` with ffmpeg, streaming the output
-/// as it's produced. MP3 first waits for a free transcode slot.
+/// as it's produced. First waits for a stream slot, and for MP3 also a
+/// transcode slot; [`HlsError::Busy`] if one doesn't free up in time. Both
+/// are held until the stream ends or is dropped.
 ///
 /// Failures — upstream errors in `aac` as well as ffmpeg itself failing —
 /// arrive as a trailing `Err` item, so the response is cut short instead of
@@ -292,14 +310,9 @@ pub async fn transcode<S>(
 where
     S: Stream<Item = Result<Bytes, HlsError>> + Send + 'static,
 {
-    let permit = if format.reencodes() {
-        let slots = TRANSCODE_SLOTS.clone();
-        Some(
-            slots
-                .acquire_owned()
-                .await
-                .expect("transcode semaphore is never closed"),
-        )
+    let stream_slot = acquire_slot(&STREAM_SLOTS, SLOT_WAIT).await?;
+    let transcode_slot = if format.reencodes() {
+        Some(acquire_slot(&TRANSCODE_SLOTS, SLOT_WAIT).await?)
     } else {
         None
     };
@@ -340,7 +353,7 @@ where
 
     // Polled once ffmpeg has closed stdout, i.e. when it's finished.
     let outcome = futures::stream::once(async move {
-        let _permit = permit;
+        let _slots = (stream_slot, transcode_slot);
         let status = child
             .wait()
             .await
@@ -360,6 +373,35 @@ where
     .filter_map(|outcome| async move { outcome.err().map(Err) });
 
     Ok(output.chain(outcome))
+}
+
+/// `body` holding a stream slot until it's dropped, for the legacy `.aac`
+/// route, which streams without ffmpeg. [`HlsError::Busy`] if no slot frees
+/// up in time.
+pub(crate) async fn with_stream_slot<S: Stream>(
+    body: S,
+) -> Result<impl Stream<Item = S::Item>, HlsError> {
+    let slot = acquire_slot(&STREAM_SLOTS, SLOT_WAIT).await?;
+    Ok(holding(slot, body))
+}
+
+/// `body`, keeping `slot` until the stream is dropped.
+fn holding<S: Stream>(slot: OwnedSemaphorePermit, body: S) -> impl Stream<Item = S::Item> {
+    body.map(move |item| {
+        let _slot = &slot;
+        item
+    })
+}
+
+/// A permit from `slots`, waiting at most `wait` for one to free up.
+async fn acquire_slot(
+    slots: &Arc<Semaphore>,
+    wait: Duration,
+) -> Result<OwnedSemaphorePermit, HlsError> {
+    match tokio::time::timeout(wait, Arc::clone(slots).acquire_owned()).await {
+        Ok(permit) => Ok(permit.expect("slot semaphores are never closed")),
+        Err(_) => Err(HlsError::Busy),
+    }
 }
 
 /// Log which ffmpeg will do the MP3 transcodes, or warn that there is none,
@@ -422,9 +464,11 @@ async fn fetch_text(client: &Client, url: &Url) -> Result<String, HlsError> {
         .timeout(FETCH_TIMEOUT)
         .send()
         .await
-        .and_then(reqwest::Response::error_for_status)
         .map_err(|err| HlsError::Upstream(describe(err)))?;
-    resp.text()
+    check_redirect(url, &resp)?;
+    resp.error_for_status()
+        .map_err(|err| HlsError::Upstream(describe(err)))?
+        .text()
         .await
         .map_err(|err| HlsError::Upstream(describe(err)))
 }
@@ -435,14 +479,16 @@ async fn fetch_segment(client: &Client, url: &Url) -> Result<Bytes, HlsError> {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
         }
-        let result = client
-            .get(url.clone())
-            .timeout(FETCH_TIMEOUT)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status);
+        let result = client.get(url.clone()).timeout(FETCH_TIMEOUT).send().await;
         let result = match result {
-            Ok(resp) => resp.bytes().await,
+            Ok(resp) => {
+                // Not worth a retry: the same URL redirects the same way.
+                check_redirect(url, &resp)?;
+                match resp.error_for_status() {
+                    Ok(resp) => resp.bytes().await,
+                    Err(err) => Err(err),
+                }
+            }
             Err(err) => Err(err),
         };
         match result {
@@ -474,9 +520,25 @@ fn describe(err: reqwest::Error) -> String {
     msg
 }
 
-fn join(base: &Url, uri: &str) -> Result<Url, HlsError> {
-    base.join(uri)
-        .map_err(|_| HlsError::Unsupported(format!("unresolvable playlist entry: {uri}")))
+/// The client follows redirects, so a vetted URL can still be answered from
+/// somewhere else. Refuse a response that ended up off Podimo's hosts.
+fn check_redirect(requested: &Url, resp: &reqwest::Response) -> Result<(), HlsError> {
+    if resp.url() == requested {
+        return Ok(());
+    }
+    check_podimo_https(resp.url())
+        .map_err(|_| HlsError::InvalidSource("redirected to a foreign host"))
+}
+
+/// A playlist entry resolved against the playlist's URL. The playlist body
+/// decides where it points, so it gets the same check as the playlist.
+fn resolve_entry(base: &Url, uri: &str) -> Result<Url, HlsError> {
+    let url = base
+        .join(uri)
+        .map_err(|_| HlsError::Unsupported(format!("unresolvable playlist entry: {uri}")))?;
+    check_podimo_https(&url)
+        .map_err(|_| HlsError::InvalidSource("playlist entry on a foreign host"))?;
+    Ok(url)
 }
 
 fn attribute(attrs: &str, name: &str) -> Option<u64> {
@@ -739,6 +801,99 @@ mod tests {
         assert!(validate_source("https://podimo.com.evil.example/a.m3u8").is_err());
         assert!(validate_source("https://media-cdn-episodes.podimo.com/a.mp3").is_err());
         assert!(validate_source("not a url").is_err());
+    }
+
+    #[test]
+    fn select_variant_rejects_a_variant_on_another_host() {
+        let base = Url::parse("https://cdn.podimo.com/ep/ep.m3u8").unwrap();
+        let master = "#EXTM3U\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=320000\n\
+            https://evil.example/x.m3u8\n";
+        assert!(matches!(
+            select_variant(master, &base),
+            Err(HlsError::InvalidSource(_))
+        ));
+    }
+
+    #[test]
+    fn media_segments_rejects_entries_off_podimo_https() {
+        let base = Url::parse("https://cdn.podimo.com/ep/hls/high/ep.m3u8").unwrap();
+        for entry in [
+            "https://evil.example/seg.ts",
+            "http://cdn.podimo.com/seg.ts",
+            "//evil.example/seg.ts",
+        ] {
+            let media = format!("#EXTM3U\n#EXTINF:10.0,\nep_0.ts\n#EXTINF:10.0,\n{entry}\n");
+            assert!(
+                matches!(
+                    media_segments(&media, &base),
+                    Err(HlsError::InvalidSource(_))
+                ),
+                "{entry}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetches_refuse_a_redirect_off_podimo() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(path("/moved.ts"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/seg.ts", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/seg.ts"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"#EXTM3U\n".to_vec()))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let url = |p: &str| Url::parse(&format!("{}{p}", server.uri())).unwrap();
+
+        // Callers vet the URLs they pass in; only where a redirect led is
+        // checked here. The mock server is off Podimo's hosts, so a redirect
+        // on it counts as leaving them.
+        assert!(fetch_segment(&client, &url("/seg.ts")).await.is_ok());
+        assert!(fetch_text(&client, &url("/seg.ts")).await.is_ok());
+        let err = fetch_segment(&client, &url("/moved.ts")).await.unwrap_err();
+        assert!(matches!(err, HlsError::InvalidSource(_)), "{err}");
+        let err = fetch_text(&client, &url("/moved.ts")).await.unwrap_err();
+        assert!(matches!(err, HlsError::InvalidSource(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn acquire_slot_gives_up_when_every_slot_stays_busy() {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = acquire_slot(&slots, Duration::from_millis(50))
+            .await
+            .unwrap();
+        let err = acquire_slot(&slots, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HlsError::Busy), "{err}");
+        drop(held);
+        assert!(acquire_slot(&slots, Duration::from_millis(50))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_slot_is_held_until_the_body_is_dropped() {
+        let slots = Arc::new(Semaphore::new(1));
+        let slot = acquire_slot(&slots, Duration::from_millis(50))
+            .await
+            .unwrap();
+        let mut body = Box::pin(holding(slot, futures::stream::iter([1, 2])));
+        assert_eq!(body.next().await, Some(1));
+        assert_eq!(body.next().await, Some(2));
+        assert_eq!(body.next().await, None);
+        assert_eq!(slots.available_permits(), 0, "held while the body lives");
+        drop(body);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[test]

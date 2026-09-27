@@ -90,15 +90,20 @@ of ~10 s MPEG-TS segments with AAC-LC. There is no progressive file upstream.
   In-cluster clients thus get `http://podimo/…` and proxied ones the public
   host.
 - `/stream` has no auth, since the signed URL is the credential, but only
-  accepts https `.m3u8` URLs on `*.podimo.com`. It takes the highest-bandwidth
-  variant, fetches segments 4 ahead with retries, demuxes TS to ADTS and pipes
-  that through ffmpeg over stdin/stdout.
+  accepts https `.m3u8` URLs on `*.podimo.com`. The variant and segment URLs
+  in the playlists, and any redirect target, must be https on `*.podimo.com`
+  too. It takes the highest-bandwidth variant, fetches segments 4 ahead with
+  retries, demuxes TS to ADTS and pipes that through ffmpeg over
+  stdin/stdout.
+- At most 16 `/stream` bodies run at once, of any format, and at most 4 of
+  them are MP3 encodes. A request that doesn't get a slot within 10 s gets 503
+  with `Retry-After: 30`. HEAD takes no slot.
 - `STREAM_FORMAT` (`hls::StreamFormat`) sets what feeds link to; both
   extensions are always served.
   - `m4a` (default): stream copy into fragmented MP4. Almost no CPU, original
     quality, and ffprobe reads the exact duration.
-  - `mp3`: LAME, 128 kbps CBR at `-q 7`. About one core per download, at most
-    4 at once. CBR keeps the duration right without a Xing header.
+  - `mp3`: LAME, 128 kbps CBR at `-q 7`. About one core per download. CBR
+    keeps the duration right without a Xing header.
 - A failure mid-stream ends the chunked body with an error rather than a short
   file that looks complete. A client disconnect kills ffmpeg. HEAD skips
   ffmpeg. `Range` is ignored.
