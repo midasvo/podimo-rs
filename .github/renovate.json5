@@ -25,11 +25,6 @@
       rangeStrategy: 'replace',
     },
     {
-      // bincode is unmaintained; 3.0.0 contains only a compile_error!.
-      matchPackageNames: ['bincode'],
-      enabled: false,
-    },
-    {
       // The workflows use major tags (@v4), so every update here is a major.
       // docker-publish.yml doesn't run on PRs: watch its run on main after
       // merging.
