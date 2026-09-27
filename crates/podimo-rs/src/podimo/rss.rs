@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use chrono::Datelike;
 use futures::future::join_all;
 use reqwest::Client;
 use rss::extension::itunes::{
@@ -132,7 +133,7 @@ pub async fn podcasts_to_rss(
     }
 
     let channel = channel.build();
-    Ok(channel.to_string())
+    Ok(strip_invalid_xml_chars(channel.to_string()))
 }
 
 /// Render a single-item RSS feed for one audiobook. Layout mirrors the podcast
@@ -213,7 +214,12 @@ pub async fn audiobook_to_rss(
         publisher.as_deref().unwrap_or(""),
     );
 
-    let pub_date = year.map(|y| format!("Thu, 01 Jan {y} 00:00:00 +0000"));
+    // 1 January of the publication year, with the right weekday.
+    let pub_date = year
+        .and_then(|y| i32::try_from(y).ok())
+        .and_then(|y| chrono::NaiveDate::from_ymd_opt(y, 1, 1))
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|dt| rfc822(dt.and_utc()));
 
     let mut itunes_item = ITunesItemExtensionBuilder::default();
     if duration > 0 {
@@ -278,7 +284,7 @@ pub async fn audiobook_to_rss(
     }
 
     let channel = channel.build();
-    Ok(channel.to_string())
+    Ok(strip_invalid_xml_chars(channel.to_string()))
 }
 
 /// Appends `"{label}{value}"` to `buf`, separated from any existing content by
@@ -309,6 +315,29 @@ fn collect_name_array(v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// Podimo's ISO 8601 timestamp as the RFC 822 date RSS requires, or `None`
+/// (no `<pubDate>`) when it doesn't parse.
+fn rfc822_date(raw: &str) -> Option<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            // No offset: treat as UTC.
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|naive| naive.and_utc())
+        })
+        .ok()?;
+    rfc822(dt)
+}
+
+/// `dt` in RFC 822 form with a two-digit day, `Mon, 01 Jan 2024 12:00:00
+/// +0000`, as feeds conventionally write it (chrono's `to_rfc2822` writes
+/// `1 Jan`). `None` for a year RFC 822 can't express.
+fn rfc822(dt: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    (1..=9999)
+        .contains(&dt.year())
+        .then(|| dt.format("%a, %d %b %Y %H:%M:%S +0000").to_string())
+}
+
 async fn build_item(
     scraper: &Client,
     head_cache: &TtlCache<HeadInfo>,
@@ -327,11 +356,18 @@ async fn build_item(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // Try publishDatetime first; fall back to datetime when it's missing or
+    // doesn't parse.
     let pub_date = episode
         .get("publishDatetime")
         .and_then(|v| v.as_str())
-        .or_else(|| episode.get("datetime").and_then(|v| v.as_str()))
-        .map(|s| s.to_string());
+        .and_then(rfc822_date)
+        .or_else(|| {
+            episode
+                .get("datetime")
+                .and_then(|v| v.as_str())
+                .and_then(rfc822_date)
+        });
 
     let (audio_url, duration) = extract_audio_url(episode);
     let Some(audio_url) = audio_url else {
@@ -437,6 +473,19 @@ fn first_non_null_string(candidates: &[Option<&Value>]) -> Option<String> {
     None
 }
 
+/// Drops the characters XML 1.0 forbids anywhere in a document: C0
+/// controls other than tab, LF and CR, and U+FFFE / U+FFFF.
+fn strip_invalid_xml_chars(xml: String) -> String {
+    let invalid = |c: char| {
+        (c < '\u{20}' && !matches!(c, '\t' | '\n' | '\r')) || matches!(c, '\u{FFFE}' | '\u{FFFF}')
+    };
+    if xml.contains(invalid) {
+        xml.chars().filter(|&c| !invalid(c)).collect()
+    } else {
+        xml
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +542,49 @@ mod tests {
         );
         assert_eq!(first_non_null_string(&[Some(&a), Some(&b)]), None);
         assert_eq!(first_non_null_string(&[None, None]), None);
+    }
+
+    #[test]
+    fn rfc822_date_converts_rfc3339_with_millis_to_rfc822() {
+        assert_eq!(
+            rfc822_date("2024-01-01T12:00:00.000Z"),
+            Some("Mon, 01 Jan 2024 12:00:00 +0000".to_string())
+        );
+        // Other offsets are converted to UTC.
+        assert_eq!(
+            rfc822_date("2024-01-01T01:30:00+02:00"),
+            Some("Sun, 31 Dec 2023 23:30:00 +0000".to_string())
+        );
+    }
+
+    #[test]
+    fn rfc822_date_falls_back_to_naive_datetime_as_utc() {
+        assert_eq!(
+            rfc822_date("2024-01-01T12:00:00"),
+            Some("Mon, 01 Jan 2024 12:00:00 +0000".to_string())
+        );
+    }
+
+    #[test]
+    fn rfc822_date_returns_none_for_unparseable_input() {
+        assert_eq!(rfc822_date("not-a-date"), None);
+    }
+
+    #[test]
+    fn strip_invalid_xml_chars_removes_c0_controls_and_noncharacters() {
+        let input = "a\u{8}b\u{b}c\u{fffe}d\u{ffff}e".to_string();
+        assert_eq!(strip_invalid_xml_chars(input), "abcde");
+    }
+
+    #[test]
+    fn strip_invalid_xml_chars_keeps_tab_lf_and_cr() {
+        let input = "line1\tline2\nline3\r\n".to_string();
+        assert_eq!(strip_invalid_xml_chars(input.clone()), input);
+    }
+
+    #[test]
+    fn strip_invalid_xml_chars_is_noop_for_clean_input() {
+        let input = "nothing to strip here".to_string();
+        assert_eq!(strip_invalid_xml_chars(input.clone()), input);
     }
 }

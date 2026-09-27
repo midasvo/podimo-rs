@@ -474,3 +474,183 @@ async fn podcasts_to_rss_routes_hls_episodes_through_stream_proxy() {
     );
     assert!(rss.contains("type=\"audio/x-m4a\""), "{rss}");
 }
+
+#[tokio::test]
+async fn podcasts_to_rss_renders_rfc822_pub_date_from_publish_datetime() {
+    let head_cache = stub_head_cache_for(&["ep1", "ep2"], "0", "audio/mpeg").await;
+    let scraper = Client::new();
+
+    let mut payload = fixed_payload();
+    payload["episodes"][0]["publishDatetime"] = json!("2024-01-01T12:00:00.000Z");
+
+    let rss = podcasts_to_rss(
+        &payload,
+        "podcast-uuid",
+        "nl-NL",
+        false,
+        Some(1),
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
+        &scraper,
+        &head_cache,
+    )
+    .await
+    .expect("render");
+
+    assert!(
+        rss.contains("<pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate>"),
+        "want RFC 822 pubDate converted from publishDatetime: {rss}"
+    );
+}
+
+#[tokio::test]
+async fn podcasts_to_rss_falls_back_to_datetime_when_publish_datetime_unparseable() {
+    let head_cache = stub_head_cache_for(&["ep1", "ep2"], "0", "audio/mpeg").await;
+    let scraper = Client::new();
+
+    let mut payload = fixed_payload();
+    payload["episodes"][0]["publishDatetime"] = json!("not-a-date");
+    payload["episodes"][0]["datetime"] = json!("2024-01-02T08:30:00Z");
+
+    let rss = podcasts_to_rss(
+        &payload,
+        "podcast-uuid",
+        "nl-NL",
+        false,
+        Some(1),
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
+        &scraper,
+        &head_cache,
+    )
+    .await
+    .expect("render");
+
+    assert!(
+        rss.contains("<pubDate>Tue, 02 Jan 2024 08:30:00 +0000</pubDate>"),
+        "want the valid datetime, converted to RFC 822, used as a fallback: {rss}"
+    );
+}
+
+#[tokio::test]
+async fn podcasts_to_rss_omits_pub_date_when_both_timestamps_unparseable() {
+    let head_cache = stub_head_cache_for(&["ep1", "ep2"], "0", "audio/mpeg").await;
+    let scraper = Client::new();
+
+    let mut payload = fixed_payload();
+    payload["episodes"][0]["publishDatetime"] = json!("not-a-date");
+    payload["episodes"][0]["datetime"] = json!("also-not-a-date");
+
+    let rss = podcasts_to_rss(
+        &payload,
+        "podcast-uuid",
+        "nl-NL",
+        false,
+        Some(1),
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
+        &scraper,
+        &head_cache,
+    )
+    .await
+    .expect("render");
+
+    assert!(
+        !rss.contains("<pubDate>"),
+        "no pubDate should be emitted when neither timestamp parses: {rss}"
+    );
+}
+
+#[tokio::test]
+async fn podcasts_to_rss_strips_xml_forbidden_control_characters() {
+    let head_cache = stub_head_cache_for(&["ep1", "ep2"], "0", "audio/mpeg").await;
+    let scraper = Client::new();
+
+    let mut payload = fixed_payload();
+    payload["episodes"][0]["title"] = json!("a\u{8}b");
+    payload["episodes"][0]["description"] = json!("Deel 1\u{b}Deel 2");
+
+    let rss = podcasts_to_rss(
+        &payload,
+        "podcast-uuid",
+        "nl-NL",
+        false,
+        Some(1),
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
+        &scraper,
+        &head_cache,
+    )
+    .await
+    .expect("render");
+
+    assert!(!rss.contains('\u{8}'), "backspace must be stripped: {rss}");
+    assert!(
+        !rss.contains('\u{b}'),
+        "vertical tab must be stripped: {rss}"
+    );
+    assert!(rss.contains("Deel 1"), "text around it must survive: {rss}");
+    assert!(rss.contains("Deel 2"), "text around it must survive: {rss}");
+}
+
+#[tokio::test]
+async fn podcasts_to_rss_keeps_tab_and_newline_in_description() {
+    let head_cache = stub_head_cache_for(&["ep1", "ep2"], "0", "audio/mpeg").await;
+    let scraper = Client::new();
+
+    let mut payload = fixed_payload();
+    payload["episodes"][0]["description"] = json!("Line1\tLine2\nLine3");
+
+    let rss = podcasts_to_rss(
+        &payload,
+        "podcast-uuid",
+        "nl-NL",
+        false,
+        Some(1),
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
+        &scraper,
+        &head_cache,
+    )
+    .await
+    .expect("render");
+
+    assert!(
+        rss.contains("Line1\tLine2\nLine3"),
+        "tab and newline are legal XML and must survive: {rss}"
+    );
+}
+
+#[tokio::test]
+async fn audiobook_to_rss_renders_rfc822_pub_date_with_correct_weekday() {
+    let head_cache = stub_head_cache_for(&["audiobook__abuid"], "0", "audio/mpeg").await;
+    let scraper = Client::new();
+
+    let rss = audiobook_to_rss(
+        &fixed_audiobook_payload(),
+        "https://example.com/audiobook.mp3",
+        "abuid",
+        "nl-NL",
+        false,
+        &scraper,
+        &head_cache,
+    )
+    .await
+    .expect("render");
+
+    // 1 January 2024 was a Monday, not the hard-coded Thursday.
+    assert!(
+        rss.contains("<pubDate>Mon, 01 Jan 2024 00:00:00 +0000</pubDate>"),
+        "want a real RFC 822 date built from the year: {rss}"
+    );
+}
