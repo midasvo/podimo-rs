@@ -39,7 +39,7 @@ minijinja = { version = "2", features = ["loader"] }
 
 # RSS
 rss = { version = "2", features = ["validation"] }
-quick-xml = "0.36"
+quick-xml = "0.42"
 
 # Caching
 moka = { version = "0.12", features = ["future"] }
