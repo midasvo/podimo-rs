@@ -29,7 +29,8 @@ pub struct HeadInfo {
 
 #[derive(Debug, Clone)]
 pub struct Caches {
-    pub(crate) tokens: TtlCache<String>,
+    /// Public so integration tests can seed a token that upstream rejects.
+    pub tokens: TtlCache<String>,
     pub(crate) podcasts: TtlCache<Arc<serde_json::Value>>,
     pub(crate) audiobook_meta: TtlCache<Arc<serde_json::Value>>,
     pub(crate) audiobook_audio: TtlCache<String>,
@@ -219,6 +220,18 @@ where
         }
         self.inner.insert(key, entry).await;
     }
+
+    /// Drop `key` from memory and disk, e.g. a login token upstream rejected.
+    pub async fn remove(&self, key: &str) {
+        self.inner.invalidate(key).await;
+        if let Some(dir) = &self.dir {
+            if let Err(err) = fs::remove_file(entry_path(dir, key)).await {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(target: "podimo::cache", "remove {} key {}: {err}", self.name, key);
+                }
+            }
+        }
+    }
 }
 
 fn now_secs() -> u64 {
@@ -369,6 +382,23 @@ mod tests {
         // `get` skips the expired entry but leaves its file in place.
         assert_eq!(c2.get("k").await, None);
         assert_eq!(c2.get_stale("k").await, Some(Hit::Expired("v".into())));
+    }
+
+    #[tokio::test]
+    async fn remove_drops_the_entry_from_memory_and_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let cache: TtlCache<String> =
+            TtlCache::new("test", Some(dir.clone()), Duration::from_secs(60)).await;
+        cache.insert("k".into(), "v".into()).await;
+
+        cache.remove("k").await;
+        assert_eq!(cache.get("k").await, None);
+        // Nothing left on disk for a restart to load.
+        let c2: TtlCache<String> = TtlCache::new("test", Some(dir), Duration::from_secs(60)).await;
+        assert_eq!(c2.get("k").await, None);
+        // Removing what isn't there is fine.
+        cache.remove("k").await;
     }
 
     /// Inserts `value` into a disk-backed cache, then reads it back through a

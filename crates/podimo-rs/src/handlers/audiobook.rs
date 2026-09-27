@@ -67,14 +67,18 @@ async fn serve(
     let meta = match meta_result {
         Ok(v) => v,
         Err(err) if err.is_not_found() => return AppError::NotFound.into_response(),
-        Err(err) => return AppError::Internal(format!("fetch audiobook: {err}")).into_response(),
+        Err(err) => {
+            auth.forget_token_after(&state, &err).await;
+            return AppError::Internal(format!("fetch audiobook: {err}")).into_response();
+        }
     };
 
     let audio_url = match audio_result {
         Ok(v) => v,
         Err(err) if err.is_not_found() => return AppError::NotFound.into_response(),
         Err(err) => {
-            return AppError::Internal(format!("fetch audiobook audio: {err}")).into_response()
+            auth.forget_token_after(&state, &err).await;
+            return AppError::Internal(format!("fetch audiobook audio: {err}")).into_response();
         }
     };
 

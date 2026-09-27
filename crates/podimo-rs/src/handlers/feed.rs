@@ -63,7 +63,10 @@ async fn serve(
     {
         Ok(v) => v,
         Err(err) if err.is_not_found() => return AppError::NotFound.into_response(),
-        Err(err) => return AppError::Internal(format!("fetch podcasts: {err}")).into_response(),
+        Err(err) => {
+            auth.forget_token_after(&state, &err).await;
+            return AppError::Internal(format!("fetch podcasts: {err}")).into_response();
+        }
     };
 
     // Stream links go back through whatever address this client used for the

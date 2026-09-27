@@ -22,6 +22,20 @@ use crate::util::{amp_arg, parse_basic_auth, split_username_region_locale, PODCA
 pub(crate) struct Authorized {
     pub client: PodimoClient,
     pub locale: String,
+    /// The token came from the cache rather than a login just now, so
+    /// upstream may have revoked it since. See [`Self::forget_token_after`].
+    pub token_from_cache: bool,
+}
+
+impl Authorized {
+    /// Called when a query with this login failed. Unless the content just
+    /// doesn't exist, a cached token may be what upstream rejected: drop it,
+    /// so the next request logs in again instead of failing until it expires.
+    pub(crate) async fn forget_token_after(&self, state: &AppState, err: &ClientError) {
+        if self.token_from_cache && !err.is_not_found() {
+            state.caches.tokens.remove(&self.client.key).await;
+        }
+    }
 }
 
 /// 401 with a body that helps the user re-craft a correct Basic-auth URL.
@@ -114,7 +128,9 @@ pub(crate) async fn authorize_request(
         Ok(c) => c,
         Err(_) => return Err(unauthorized_response(&state.config.hostname)),
     };
-    if let Some(token) = state.caches.tokens.get(&client.key).await {
+    let cached_token = state.caches.tokens.get(&client.key).await;
+    let token_from_cache = cached_token.is_some();
+    if let Some(token) = cached_token {
         client.token = Some(token);
     } else {
         match client.login(&state.scraper, &state.config).await {
@@ -129,5 +145,9 @@ pub(crate) async fn authorize_request(
         }
     }
 
-    Ok(Authorized { client, locale })
+    Ok(Authorized {
+        client,
+        locale,
+        token_from_cache,
+    })
 }
