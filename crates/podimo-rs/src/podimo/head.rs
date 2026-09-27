@@ -4,11 +4,18 @@ use std::time::Duration;
 
 use reqwest::Client;
 
-use crate::cache::{HeadInfo, TtlCache};
+use crate::cache::{HeadInfo, Hit, TtlCache};
 
 const RETRIES: u32 = 3;
 const TIMEOUT_PER_TRY: Duration = Duration::from_secs(10);
 
+/// Content length and type of the media at `url`, cached under `episode_id`.
+///
+/// A fresh cache entry skips the probe. If every attempt fails, an expired
+/// entry is returned instead of the error, so a flaky upstream doesn't drop
+/// the episode from its feed. Only request errors (a timeout, a refused
+/// connection) fail an attempt: any HTTP response, error statuses included,
+/// is cached as the answer.
 pub async fn url_head_info(
     scraper: &Client,
     cache: &TtlCache<HeadInfo>,
@@ -16,11 +23,11 @@ pub async fn url_head_info(
     url: &str,
     locale: &str,
 ) -> Result<HeadInfo, reqwest::Error> {
-    // Use get_no_expire: a stale-but-present cached entry beats a transient HEAD
-    // failure, and the historical record stays on disk for inspection.
-    if let Some(cached) = cache.get_no_expire(episode_id).await {
-        return Ok(cached);
-    }
+    let expired = match cache.get_stale(episode_id).await {
+        Some(Hit::Fresh(info)) => return Ok(info),
+        Some(Hit::Expired(info)) => Some(info),
+        None => None,
+    };
 
     let headers = crate::util::generate_headers(None, locale);
 
@@ -68,7 +75,14 @@ pub async fn url_head_info(
             }
         }
     }
-    Err(last_err.expect("loop ran at least once"))
+    let err = last_err.expect("loop ran at least once");
+    match expired {
+        Some(info) => {
+            tracing::warn!(target: "podimo", "HEAD probe failed for {episode_id}, using its expired cached size: {err}");
+            Ok(info)
+        }
+        None => Err(err),
+    }
 }
 
 fn strip_query(url: &str) -> &str {
