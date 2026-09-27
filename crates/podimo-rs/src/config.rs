@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+use crate::podimo::hls::StreamFormat;
 use crate::util::parse_bool_loose;
 
 pub type SharedConfig = Arc<Config>;
@@ -44,6 +45,11 @@ pub struct Config {
     pub library_dir: String,
 
     pub public_feeds: bool,
+
+    /// Format the feed links HLS episodes as: `mp3` (re-encoded, plays
+    /// everywhere) or `m4a` (Podimo's AAC repackaged, near-zero CPU).
+    /// `/stream` serves both either way; this only picks the enclosure.
+    pub stream_format: StreamFormat,
 
     /// Podimo GraphQL endpoint. Overridable via `PODIMO_GRAPHQL_URL` so
     /// integration tests can point at a wiremock server. Defaults to the
@@ -86,6 +92,8 @@ impl Config {
 
             public_feeds: env_bool("PUBLIC_FEEDS", false),
 
+            stream_format: env_stream_format()?,
+
             graphql_url: env_or("PODIMO_GRAPHQL_URL", "https://podimo.com/graphql"),
         })
     }
@@ -104,6 +112,7 @@ impl Config {
         tracing::info!(target: "podimo", "PODIMO_BIND_HOST: {}", self.bind_host);
         tracing::info!(target: "podimo", "PODIMO_PROTOCOL: {}", self.protocol);
         tracing::info!(target: "podimo", "PUBLIC_FEEDS: {}", self.public_feeds);
+        tracing::info!(target: "podimo", "STREAM_FORMAT: {}", self.stream_format.extension());
         tracing::info!(target: "podimo", "HTTP_PROXY: {:?}", self.http_proxy);
         tracing::info!(target: "podimo", "ZENROWS_API set: {}", self.zenrows_api.is_some());
         tracing::info!(target: "podimo", "SCRAPER_API set: {}", self.scraper_api.is_some());
@@ -132,6 +141,14 @@ fn env_bool(key: &str, default: bool) -> bool {
     env::var(key)
         .map(|v| parse_bool_loose(&v))
         .unwrap_or(default)
+}
+
+/// Unlike the lenient helpers above, a typo here fails startup: silently
+/// falling back would hide which format the feed actually serves.
+fn env_stream_format() -> anyhow::Result<StreamFormat> {
+    let value = env_or("STREAM_FORMAT", "mp3");
+    StreamFormat::from_extension(&value.trim().to_ascii_lowercase())
+        .ok_or_else(|| anyhow::anyhow!("STREAM_FORMAT must be `mp3` or `m4a`, got `{value}`"))
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {

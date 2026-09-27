@@ -9,7 +9,8 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use podimo_rs::cache::{HeadInfo, TtlCache};
-use podimo_rs::podimo::rss::{audiobook_to_rss, podcasts_to_rss};
+use podimo_rs::podimo::hls::StreamFormat;
+use podimo_rs::podimo::rss::{audiobook_to_rss, podcasts_to_rss, StreamLinks};
 use reqwest::Client;
 use serde_json::json;
 
@@ -83,7 +84,10 @@ async fn podcasts_to_rss_renders_expected_structure() {
         "nl-NL",
         false,
         None,
-        "http://proxy.test",
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
         &scraper,
         &head_cache,
     )
@@ -142,7 +146,10 @@ async fn podcasts_to_rss_appends_jpg_fragment_to_extensionless_image_urls() {
         "nl-NL",
         false,
         None,
-        "http://proxy.test",
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
         &scraper,
         &head_cache,
     )
@@ -176,7 +183,10 @@ async fn podcasts_to_rss_preserves_existing_jpg_extension() {
         "nl-NL",
         false,
         None,
-        "http://proxy.test",
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
         &scraper,
         &head_cache,
     )
@@ -200,7 +210,10 @@ async fn podcasts_to_rss_limits_to_n_newest_episodes() {
         "nl-NL",
         false,
         Some(1),
-        "http://proxy.test",
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
         &scraper,
         &head_cache,
     )
@@ -224,7 +237,10 @@ async fn podcasts_to_rss_limit_larger_than_episode_count_is_noop() {
         "nl-NL",
         false,
         Some(999),
-        "http://proxy.test",
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
         &scraper,
         &head_cache,
     )
@@ -245,7 +261,10 @@ async fn podcasts_to_rss_sets_itunes_block_when_public_feeds_disabled() {
         "nl-NL",
         /*public_feeds=*/ false,
         None,
-        "http://proxy.test",
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
         &scraper,
         &head_cache,
     )
@@ -262,7 +281,10 @@ async fn podcasts_to_rss_sets_itunes_block_when_public_feeds_disabled() {
         "nl-NL",
         /*public_feeds=*/ true,
         None,
-        "http://proxy.test",
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
         &scraper,
         &head_cache,
     )
@@ -406,7 +428,10 @@ async fn podcasts_to_rss_routes_hls_episodes_through_stream_proxy() {
         "nl-NL",
         false,
         None,
-        "http://proxy.test",
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::Mp3,
+        },
         &scraper,
         &head_cache,
     )
@@ -426,4 +451,26 @@ async fn podcasts_to_rss_routes_hls_episodes_through_stream_proxy() {
     );
     assert!(!rss.contains("audio/x-mpegurl"), "{rss}");
     assert!(rss.contains("<itunes:duration>1234</itunes:duration>"));
+
+    // STREAM_FORMAT=m4a: same route, M4A file and type.
+    let rss = podcasts_to_rss(
+        &payload,
+        "podcast-uuid",
+        "nl-NL",
+        false,
+        None,
+        StreamLinks {
+            base_url: "http://proxy.test",
+            format: StreamFormat::M4a,
+        },
+        &scraper,
+        &head_cache,
+    )
+    .await
+    .expect("render");
+    assert!(
+        rss.contains(&format!("url=\"http://proxy.test/stream/{token}/ep1.m4a\"")),
+        "enclosure should point at the M4A stream: {rss}"
+    );
+    assert!(rss.contains("type=\"audio/x-m4a\""), "{rss}");
 }

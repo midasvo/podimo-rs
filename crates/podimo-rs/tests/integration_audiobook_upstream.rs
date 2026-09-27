@@ -38,6 +38,7 @@ fn make_config(graphql_url: String) -> Config {
         library_dir: "./library".into(),
         public_feeds: false,
         graphql_url,
+        stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
     }
 }
 

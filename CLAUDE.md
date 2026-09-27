@@ -13,9 +13,10 @@ Endpoints:
   the latest N episodes.
 - `GET /audiobook/<audiobook_id>.xml` — single-item RSS feed for one Podimo
   audiobook (the book itself is the lone episode).
-- `GET /stream/<token>/<episode_id>.mp3` — transcodes an HLS episode to one
-  progressive MP3 (ffmpeg). Feed enclosures point here for any episode whose
-  audio URL is an `.m3u8` (see "HLS episodes" below). The older
+- `GET /stream/<token>/<episode_id>.mp3|.m4a` — turns an HLS episode into one
+  progressive file via ffmpeg: MP3 (re-encoded) or M4A (AAC repackaged). Feed
+  enclosures point here for any episode whose audio URL is an `.m3u8`, in the
+  `STREAM_FORMAT` (see "HLS episodes" below). The older
   `GET /stream/<episode_id>.aac?src=…` AAC remux is kept for stored URLs.
 - `GET /library` + `/library/*` — opt-in audiobook library (downloads books
   to disk for permanent local storage). Requires `ENABLE_LIBRARY=true` +
@@ -67,7 +68,7 @@ Docker build matches CI: `docker build -t podimo-rs:test .` then
 │       │   │   ├── feed.rs          # GET /feed/<id>.xml
 │       │   │   ├── audiobook.rs     # GET /audiobook/<id>.xml
 │       │   │   ├── library.rs       # GET /library + /library/* (opt-in)
-│       │   │   ├── stream.rs        # GET /stream/<token>/<id>.mp3 (HLS → MP3)
+│       │   │   ├── stream.rs        # GET /stream/<token>/<id>.mp3|.m4a (HLS → file)
 │       │   │   └── not_found.rs     # fallback
 │       │   ├── library/
 │       │   │   ├── mod.rs           # Library struct + on-disk hydration
@@ -129,12 +130,26 @@ is a signed master playlist on `media-cdn-episodes.podimo.com` (192k/320k
 variants of ~10 s MPEG-TS segments carrying AAC-LC, unencrypted). No MP3
 sibling is reachable on the CDN.
 
-`podcasts_to_rss` rewrites such enclosures to `<base>/stream/<token>/<id>.mp3`
-with `type="audio/mpeg"` and `length="0"` (size unknown up front; no HEAD
-probe). `token` is the signed `.m3u8` URL in unpadded base64url: carrying it
-in the path keeps the URL a plain `….mp3` with no query string and no `.m3u8`
-anywhere in it — Audiobookshelf derives the file type from the URL, and raw
-AAC also leaves it guessing the duration (no header to read it from).
+`podcasts_to_rss` rewrites such enclosures to `<base>/stream/<token>/<id>.<ext>`
+with `length="0"` (size unknown up front; no HEAD probe). `token` is the
+signed `.m3u8` URL in unpadded base64url: carrying it in the path keeps the
+URL a plain `….mp3`/`….m4a` with no query string and no `.m3u8` anywhere in
+it — Audiobookshelf derives the file type from the URL, and raw AAC also
+leaves it guessing the duration (no header to read it from).
+
+`STREAM_FORMAT` picks `<ext>` (`hls::StreamFormat`):
+
+- `mp3` (default, `audio/mpeg`): LAME 128 kbps CBR at `-q 7`. CBR keeps
+  duration estimates exact without a Xing header (none on a pipe); `-q 7` cost
+  ~40% less CPU than LAME's default in benchmarks with no audible difference on
+  speech. Still ~1 core for the length of the transcode (a 47-min episode:
+  ~10 s on a desktop, ~50 s on a small server).
+- `m4a` (`audio/x-m4a`): the AAC stream-copied into a fragmented MP4
+  (`-c:a copy -bsf:a aac_adtstoasc -movflags +empty_moov+default_base_moof
+  -frag_duration 10000000`) — no re-encode, original quality, ~0.3 s CPU per
+  episode; ffprobe reads the exact duration from the fragments.
+
+Both routes are always served; the setting only decides what the feed links.
 
 `<base>` is the address the feed request itself came in on
 (`util::request_base_url`: `X-Forwarded-Proto`/`X-Forwarded-Host` from a
@@ -148,11 +163,11 @@ hostname may resolve to an address pods can't route to.
 accepts `https` playlists on `*.podimo.com`. It picks the highest-`BANDWIDTH`
 variant, fetches segments 4 ahead with retries, and a tiny TS demuxer (PAT →
 PMT → stream_type 0x0F → PES payloads) turns them into raw ADTS AAC. That is
-piped into `ffmpeg -f aac -i pipe:0 -c:a libmp3lame -b:a 192k -f mp3 pipe:1`
-(stdin/stdout only; ffmpeg never touches the network), at most 4 at a time.
-A failed upstream fetch or ffmpeg failure ends the chunked body with an error
-so clients see a broken download, not a short "complete" one; dropping the
-body kills ffmpeg. `HEAD` resolves the playlists but skips the transcode.
+piped into `ffmpeg -f aac -i pipe:0 … pipe:1` (stdin/stdout only; ffmpeg never
+touches the network). At most 4 MP3 encodes run at once; M4A doesn't take a
+slot. A failed upstream fetch or ffmpeg failure ends the chunked body with an
+error so clients see a broken download, not a short "complete" one; dropping
+the body kills ffmpeg. `HEAD` resolves the playlists but skips ffmpeg.
 `Range` is ignored (200 with the full stream).
 
 The earlier `GET /stream/<id>.aac?src=<url-encoded m3u8>` (ADTS AAC, no

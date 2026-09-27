@@ -1,8 +1,10 @@
 //! Progressive audio for HLS episodes (see `podimo::hls`):
 //!
-//! - `GET /stream/<token>/<episode_id>.mp3` — what feed enclosures point at:
-//!   transcoded to MP3 by ffmpeg. `token` is the signed Podimo `.m3u8` URL in
-//!   base64url, so the URL itself ends in a plain `.mp3`.
+//! - `GET /stream/<token>/<episode_id>.mp3|.m4a` — what feed enclosures point
+//!   at: MP3 re-encoded by ffmpeg, or the AAC repackaged as M4A. `token` is
+//!   the signed Podimo `.m3u8` URL in base64url, so the URL itself ends in a
+//!   plain file extension. Both formats are always served; `STREAM_FORMAT`
+//!   only decides which one the feed links to.
 //! - `GET /stream/<episode_id>.aac?src=<signed .m3u8>` — the earlier AAC remux,
 //!   kept so enclosure URLs that podcatchers already stored keep working.
 //!
@@ -20,25 +22,30 @@ use reqwest::Url;
 use std::collections::HashMap;
 
 use crate::error::AppError;
-use crate::podimo::hls::{self, HlsError};
+use crate::podimo::hls::{self, HlsError, StreamFormat};
 use crate::state::AppState;
 use crate::util::PODCAST_ID_RE;
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/stream/:file", get(serve_aac))
-        .route("/stream/:token/:file", get(serve_mp3))
+        .route("/stream/:token/:file", get(serve_transcoded))
 }
 
-async fn serve_mp3(
+async fn serve_transcoded(
     State(state): State<AppState>,
     method: Method,
     Path((token, file)): Path<(String, String)>,
 ) -> Response {
-    let episode_id = match episode_id(&file, ".mp3") {
-        Ok(id) => id,
-        Err(resp) => return resp,
+    let Some((episode_id, format)) = file
+        .rsplit_once('.')
+        .and_then(|(id, ext)| Some((id, StreamFormat::from_extension(ext)?)))
+    else {
+        return (StatusCode::NOT_FOUND, "404 Not found.").into_response();
     };
+    if let Err(resp) = check_episode_id(episode_id) {
+        return resp;
+    }
     let src = match hls::decode_source_token(&token) {
         Ok(src) => src,
         Err(err) => return AppError::BadRequest(err.to_string()).into_response(),
@@ -51,10 +58,11 @@ async fn serve_mp3(
     // queue for a transcode slot) for a body axum throws away anyway.
     if method == Method::HEAD {
         let empty = futures::stream::empty();
-        return audio_response(episode_id, "mp3", hls::MP3_CONTENT_TYPE, empty);
+        return audio_response(episode_id, format.extension(), format.content_type(), empty);
     }
-    match hls::transcode_to_mp3(hls::aac_stream(state.scraper.clone(), segments)).await {
-        Ok(mp3) => audio_response(episode_id, "mp3", hls::MP3_CONTENT_TYPE, mp3),
+    let aac = hls::aac_stream(state.scraper.clone(), segments);
+    match hls::transcode(aac, format).await {
+        Ok(body) => audio_response(episode_id, format.extension(), format.content_type(), body),
         Err(err) => AppError::Internal(format!("stream {episode_id}: {err}")).into_response(),
     }
 }
@@ -64,10 +72,12 @@ async fn serve_aac(
     Path(file): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let episode_id = match episode_id(&file, ".aac") {
-        Ok(id) => id,
-        Err(resp) => return resp,
+    let Some(episode_id) = file.strip_suffix(".aac") else {
+        return (StatusCode::NOT_FOUND, "404 Not found.").into_response();
     };
+    if let Err(resp) = check_episode_id(episode_id) {
+        return resp;
+    }
     let Some(src) = params.get("src") else {
         return AppError::BadRequest("Missing src".into()).into_response();
     };
@@ -81,16 +91,13 @@ async fn serve_aac(
 
 // The `Response` errors below go straight back to axum, same as `library_or_404`.
 
-/// The episode id from `<id><ext>`, or the response to send instead.
 #[allow(clippy::result_large_err)]
-fn episode_id<'a>(file: &'a str, ext: &str) -> Result<&'a str, Response> {
-    let Some(id) = file.strip_suffix(ext) else {
-        return Err((StatusCode::NOT_FOUND, "404 Not found.").into_response());
-    };
-    if !PODCAST_ID_RE.is_match(id) {
-        return Err(AppError::BadRequest("Invalid episode id".into()).into_response());
+fn check_episode_id(id: &str) -> Result<(), Response> {
+    if PODCAST_ID_RE.is_match(id) {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest("Invalid episode id".into()).into_response())
     }
-    Ok(id)
 }
 
 /// Vet `src` and fetch its playlists down to the segment list.

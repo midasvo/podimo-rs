@@ -32,6 +32,7 @@ async fn healthz_returns_200_json() {
         library_dir: "./library".into(),
         public_feeds: false,
         graphql_url: "https://example.invalid/graphql".into(),
+        stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
     };
     let state = AppState::new(config).await.expect("state");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

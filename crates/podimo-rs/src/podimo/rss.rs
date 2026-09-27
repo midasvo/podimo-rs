@@ -12,11 +12,19 @@ use serde_json::Value;
 
 use crate::cache::{HeadInfo, TtlCache};
 use crate::podimo::head::url_head_info;
-use crate::podimo::hls::{is_hls_url, mp3_enclosure_url, MP3_CONTENT_TYPE};
+use crate::podimo::hls::{is_hls_url, stream_enclosure_url, StreamFormat};
 use crate::util::jpg_fragment;
 
 const ITUNES_NS: &str = "http://www.itunes.com/dtds/podcast-1.0.dtd";
 const CONCURRENT_HEAD_PROBES: usize = 10;
+
+/// Where enclosures of HLS episodes point: our `/stream` route on
+/// `base_url` (normally the address the feed was requested on), in `format`.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamLinks<'a> {
+    pub base_url: &'a str,
+    pub format: StreamFormat,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn podcasts_to_rss(
@@ -25,7 +33,7 @@ pub async fn podcasts_to_rss(
     locale: &str,
     public_feeds: bool,
     limit: Option<usize>,
-    stream_base_url: &str,
+    stream_links: StreamLinks<'_>,
     scraper: &Client,
     head_cache: &TtlCache<HeadInfo>,
 ) -> anyhow::Result<String> {
@@ -76,7 +84,7 @@ pub async fn podcasts_to_rss(
         let batch = join_all(
             chunk
                 .iter()
-                .map(|ep| build_item(scraper, head_cache, ep, locale, stream_base_url)),
+                .map(|ep| build_item(scraper, head_cache, ep, locale, stream_links)),
         )
         .await;
         for res in batch {
@@ -306,7 +314,7 @@ async fn build_item(
     head_cache: &TtlCache<HeadInfo>,
     episode: &Value,
     locale: &str,
-    stream_base_url: &str,
+    stream_links: StreamLinks<'_>,
 ) -> anyhow::Result<Option<rss::Item>> {
     let id = episode.get("id").and_then(|v| v.as_str()).unwrap_or("?");
     let title = episode
@@ -331,13 +339,18 @@ async fn build_item(
     };
 
     let enclosure = if is_hls_url(&audio_url) {
-        // HLS playlists are useless to podcatchers; point at our MP3
-        // transcode instead. Its size isn't known up front, and 0 is the
+        // HLS playlists are useless to podcatchers; point at our own
+        // MP3/M4A stream instead. Its size isn't known up front, and 0 is the
         // conventional "unknown" enclosure length.
         EnclosureBuilder::default()
-            .url(mp3_enclosure_url(stream_base_url, id, &audio_url))
+            .url(stream_enclosure_url(
+                stream_links.base_url,
+                id,
+                &audio_url,
+                stream_links.format,
+            ))
             .length("0".to_string())
-            .mime_type(MP3_CONTENT_TYPE.to_string())
+            .mime_type(stream_links.format.content_type().to_string())
             .build()
     } else {
         // url_head_info already bounds total time via RETRIES * TIMEOUT_PER_TRY +

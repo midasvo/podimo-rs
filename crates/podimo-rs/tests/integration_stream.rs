@@ -37,6 +37,7 @@ fn make_test_config() -> Config {
         library_dir: "./library".into(),
         public_feeds: false,
         graphql_url: "https://example.invalid/graphql".into(),
+        stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
     };
     // Leak the tempdir so the cache dir persists for the test's lifetime.
     std::mem::forget(cache_dir);
@@ -74,6 +75,15 @@ async fn mp3_route_requires_mp3_suffix() {
 async fn mp3_route_rejects_malformed_token() {
     let addr = boot().await;
     let resp = get(addr, &format!("/stream/not*base64/{EPISODE}.mp3")).await;
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("malformed token"));
+}
+
+#[tokio::test]
+async fn m4a_is_served_on_the_same_route() {
+    let addr = boot().await;
+    // Gets as far as token validation, so the route and extension are accepted.
+    let resp = get(addr, &format!("/stream/not*base64/{EPISODE}.m4a")).await;
     assert_eq!(resp.status(), 400);
     assert!(resp.text().await.unwrap().contains("malformed token"));
 }

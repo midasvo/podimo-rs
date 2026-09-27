@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use crate::error::AppError;
 use crate::handlers::auth::authorize_request;
+use crate::podimo::rss::StreamLinks;
 use crate::state::AppState;
 use crate::util::{amp_arg, request_base_url};
 
@@ -70,13 +71,17 @@ async fn serve(
     // through the public reverse proxy each get links they can reach.
     let fallback = format!("{}://{}", state.config.protocol, state.config.hostname);
     let stream_base_url = request_base_url(&req_headers, &fallback);
+    let stream_links = StreamLinks {
+        base_url: &stream_base_url,
+        format: state.config.stream_format,
+    };
     match crate::podimo::rss::podcasts_to_rss(
         &payload,
         podcast_id,
         &auth.locale,
         state.config.public_feeds,
         limit,
-        &stream_base_url,
+        stream_links,
         &state.scraper,
         &state.caches.head,
     )

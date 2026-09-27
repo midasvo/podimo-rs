@@ -34,6 +34,7 @@ fn make_test_config<F: FnOnce(&mut Config)>(tweak: F) -> Config {
         library_dir: "./library".into(),
         public_feeds: false,
         graphql_url: "https://example.invalid/graphql".into(),
+        stream_format: podimo_rs::podimo::hls::StreamFormat::Mp3,
     };
     tweak(&mut config);
     std::mem::forget(cache_dir);
