@@ -275,19 +275,37 @@ pub fn media_segments(text: &str, base: &Url) -> Result<Vec<Url>, HlsError> {
 /// Stream the concatenated ADTS AAC of `segments`, fetching a few ahead.
 /// An `Err` item aborts the response mid-body, so a client never mistakes a
 /// truncated episode for a complete one.
+///
+/// Each fetch runs as its own task. A future inside `buffered` only makes
+/// progress while the stream is polled, and a slow or paused client can keep
+/// the consumer away for longer than a fetch's timeout: the prefetched
+/// download would then fail on that timeout even though the CDN answered
+/// long ago. A task finishes on its own and holds its bytes until they're
+/// wanted. Dropping the stream aborts the tasks.
 pub fn aac_stream(
     client: Client,
     segments: Vec<Url>,
+) -> impl Stream<Item = Result<Bytes, HlsError>> {
+    aac_stream_with_timeout(client, segments, FETCH_TIMEOUT)
+}
+
+fn aac_stream_with_timeout(
+    client: Client,
+    segments: Vec<Url>,
+    fetch_timeout: Duration,
 ) -> impl Stream<Item = Result<Bytes, HlsError>> {
     let mut demuxer = TsDemuxer::default();
     futures::stream::iter(segments)
         .map(move |url| {
             let client = client.clone();
-            async move { fetch_segment(&client, &url).await }
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                fetch_segment(&client, &url, fetch_timeout).await
+            }))
         })
         .buffered(SEGMENT_PREFETCH)
-        .map(move |segment| {
-            let segment = segment?;
+        .map(move |joined| {
+            let segment =
+                joined.map_err(|err| HlsError::Upstream(format!("segment task: {err}")))??;
             let mut out = Vec::with_capacity(segment.len());
             demuxer.push(&segment, &mut out)?;
             Ok(Bytes::from(out))
@@ -473,13 +491,13 @@ async fn fetch_text(client: &Client, url: &Url) -> Result<String, HlsError> {
         .map_err(|err| HlsError::Upstream(describe(err)))
 }
 
-async fn fetch_segment(client: &Client, url: &Url) -> Result<Bytes, HlsError> {
+async fn fetch_segment(client: &Client, url: &Url, timeout: Duration) -> Result<Bytes, HlsError> {
     let mut last_err = None;
     for attempt in 0..SEGMENT_RETRIES {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
         }
-        let result = client.get(url.clone()).timeout(FETCH_TIMEOUT).send().await;
+        let result = client.get(url.clone()).timeout(timeout).send().await;
         let result = match result {
             Ok(resp) => {
                 // Not worth a retry: the same URL redirects the same way.
@@ -857,9 +875,12 @@ mod tests {
         // Callers vet the URLs they pass in; only where a redirect led is
         // checked here. The mock server is off Podimo's hosts, so a redirect
         // on it counts as leaving them.
-        assert!(fetch_segment(&client, &url("/seg.ts")).await.is_ok());
+        let seg = fetch_segment(&client, &url("/seg.ts"), FETCH_TIMEOUT).await;
+        assert!(seg.is_ok());
         assert!(fetch_text(&client, &url("/seg.ts")).await.is_ok());
-        let err = fetch_segment(&client, &url("/moved.ts")).await.unwrap_err();
+        let err = fetch_segment(&client, &url("/moved.ts"), FETCH_TIMEOUT)
+            .await
+            .unwrap_err();
         assert!(matches!(err, HlsError::InvalidSource(_)), "{err}");
         let err = fetch_text(&client, &url("/moved.ts")).await.unwrap_err();
         assert!(matches!(err, HlsError::InvalidSource(_)), "{err}");
@@ -894,6 +915,44 @@ mod tests {
         assert_eq!(slots.available_permits(), 0, "held while the body lives");
         drop(body);
         assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn prefetched_segments_survive_a_consumer_slower_than_the_timeout() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A client reading slower than real time stalls the consumer between
+        // items for longer than the fetch timeout. Segments fetched ahead
+        // must not fail on their timeouts meanwhile.
+        let fetch_timeout = Duration::from_secs(1);
+        let consumer_pause = Duration::from_millis(1250);
+        let server = MockServer::start().await;
+        let segment = [pat(), pmt(STREAM_TYPE_ADTS_AAC), pes_start(&[1, 2, 3])].concat();
+        let mut segments = Vec::new();
+        for (i, delay_ms) in [0, 50, 250, 600].into_iter().enumerate() {
+            let seg_path = format!("/seg{i}.ts");
+            Mock::given(path(seg_path.as_str()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(segment.clone())
+                        .set_delay(Duration::from_millis(delay_ms)),
+                )
+                .mount(&server)
+                .await;
+            segments.push(Url::parse(&format!("{}{seg_path}", server.uri())).unwrap());
+        }
+
+        let stream = aac_stream_with_timeout(Client::new(), segments, fetch_timeout);
+        let mut stream = std::pin::pin!(stream);
+        let mut items = 0;
+        while let Some(item) = stream.next().await {
+            let item = item.unwrap_or_else(|err| panic!("segment {items}: {err}"));
+            assert_eq!(item.as_ref(), [1, 2, 3]);
+            items += 1;
+            tokio::time::sleep(consumer_pause).await;
+        }
+        assert_eq!(items, 4);
     }
 
     #[test]
