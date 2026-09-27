@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use podimo_rs::library::{LibraryEntry, Status};
 use podimo_rs::{app, config::Config, AppState};
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_test_config(library_dir: String) -> Config {
     let cache_dir = tempfile::tempdir().expect("tempdir");
@@ -41,8 +44,16 @@ fn make_test_config(library_dir: String) -> Config {
     }
 }
 
-async fn boot_with_library_dir(dir: String) -> (SocketAddr, tokio::task::JoinHandle<()>, AppState) {
-    let config = make_test_config(dir);
+/// Same as `make_test_config` but with `graphql_url` overridden — used by the
+/// retry happy-path test, which points it at a wiremock server. Kept as a
+/// separate function so every other test's config is unaffected.
+fn make_test_config_with_graphql_url(library_dir: String, graphql_url: String) -> Config {
+    let mut config = make_test_config(library_dir);
+    config.graphql_url = graphql_url;
+    config
+}
+
+async fn boot_with_config(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>, AppState) {
     let state = AppState::new(config).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -51,6 +62,10 @@ async fn boot_with_library_dir(dir: String) -> (SocketAddr, tokio::task::JoinHan
         axum::serve(listener, router).await.unwrap();
     });
     (addr, handle, state)
+}
+
+async fn boot_with_library_dir(dir: String) -> (SocketAddr, tokio::task::JoinHandle<()>, AppState) {
+    boot_with_config(make_test_config(dir)).await
 }
 
 fn http_client() -> reqwest::Client {
@@ -461,6 +476,207 @@ async fn index_shows_library_link_when_enabled() {
     assert!(
         body.contains("audiobook library"),
         "library link missing from index: {body}"
+    );
+    handle.abort();
+}
+
+/// Mock dispatcher for the retry happy-path test: routes `POST /graphql` by
+/// GraphQL operation name, mirroring the pattern in
+/// `tests/integration_audiobook_upstream.rs`. Login succeeds, metadata
+/// returns cover art hosted on this same mock server, and the short-lived
+/// audio query returns an audio URL hosted here too, so nothing in this test
+/// reaches the real Podimo.
+async fn install_retry_upstream_mock(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/audio.mp3"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"audio-bytes".to_vec()))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cover.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"cover-bytes".to_vec()))
+        .mount(server)
+        .await;
+
+    let cover_url = format!("{}/cover.jpg", server.uri());
+    let audio_url = format!("{}/audio.mp3", server.uri());
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let query = body.get("query").and_then(|q| q.as_str()).unwrap_or("");
+            if query.contains("AuthorizationPreregisterUser") {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "tokenWithPreregisterUser": { "token": "preauth-token" } }
+                }))
+            } else if query.contains("OnboardingQuery") {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "userOnboardingFlow": { "id": "onboarding-id" } }
+                }))
+            } else if query.contains("AuthorizationAuthorize") {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "tokenWithCredentials": { "token": "user-token" } }
+                }))
+            } else if query.contains("AudiobookResultsQuery") {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {
+                        "audiobookById": {
+                            "id": "22223333-4444-5555-6666-777788889999",
+                            "title": "Retried Book",
+                            "authorNames": "An Author",
+                            "description": "A retried description.",
+                            "duration": 3600,
+                            "publisherName": "A Publisher",
+                            "yearOfBookPublication": 2024,
+                            "authors": [{"name": "An Author"}],
+                            "narrators": [{"name": "A Narrator"}],
+                            "coverImage": { "url": cover_url.clone() },
+                            "language": { "isoLanguage": "nl" }
+                        }
+                    }
+                }))
+            } else if query.contains("ShortLivedAudiobookMediaUrlQuery") {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "audiobookAudioById": { "url": audio_url.clone() } }
+                }))
+            } else {
+                ResponseTemplate::new(500).set_body_string("unexpected graphql query")
+            }
+        })
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn retry_failed_download_completes_against_mock_upstream() {
+    let server = MockServer::start().await;
+    install_retry_upstream_mock(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let config = make_test_config_with_graphql_url(dir, format!("{}/graphql", server.uri()));
+    let (addr, handle, state) = boot_with_config(config).await;
+
+    let library = state.library.as_ref().unwrap();
+    let id = "22223333-4444-5555-6666-777788889999";
+    library.add(sample(id, Status::Failed)).await.unwrap();
+
+    let resp = http_client()
+        .post(format!("http://{addr}/library/{id}/retry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "redirect should resolve to /library");
+
+    // The download runs in a spawned background task; poll until it settles.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let entry = loop {
+        let entry = library.get(id).await.unwrap();
+        if !matches!(entry.status, Status::Queued | Status::Downloading) {
+            break entry;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("retry did not finish within 5s (last seen: {entry:?})");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(entry.status, Status::Done, "unexpected status: {entry:?}");
+    assert!(
+        library.audio_path(&entry).exists(),
+        "audio file should exist after a successful retry"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn retry_done_entry_is_a_noop_and_redirects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let (addr, handle, state) = boot_with_library_dir(dir).await;
+
+    let library = state.library.as_ref().unwrap();
+    let id = "33334444-5555-6666-7777-888899990000";
+    library.add(sample(id, Status::Done)).await.unwrap();
+
+    let resp = http_client()
+        .post(format!("http://{addr}/library/{id}/retry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "redirect should resolve to /library");
+
+    let entry = library.get(id).await.unwrap();
+    assert_eq!(entry.status, Status::Done, "status must be unchanged");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn retry_unknown_id_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let (addr, handle, _state) = boot_with_library_dir(dir).await;
+
+    let resp = http_client()
+        .post(format!(
+            "http://{addr}/library/44445555-6666-7777-8888-999900001111/retry"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn retry_invalid_id_returns_400() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let (addr, handle, _state) = boot_with_library_dir(dir).await;
+
+    let resp = http_client()
+        .post(format!("http://{addr}/library/not-a-valid-id/retry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn retry_button_shown_only_for_failed_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::mem::forget(tmp);
+    let (addr, handle, state) = boot_with_library_dir(dir).await;
+
+    let library = state.library.as_ref().unwrap();
+    let failed_id = "55556666-7777-8888-9999-000011112222";
+    let done_id = "66667777-8888-9999-0000-111122223333";
+    library
+        .add(sample(failed_id, Status::Failed))
+        .await
+        .unwrap();
+    library.add(sample(done_id, Status::Done)).await.unwrap();
+
+    let resp = http_client()
+        .get(format!("http://{addr}/library"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(&format!("/library/{failed_id}/retry")),
+        "retry form missing for failed entry: {body}"
+    );
+    assert!(
+        !body.contains(&format!("/library/{done_id}/retry")),
+        "retry form should not appear for a done entry: {body}"
     );
     handle.abort();
 }

@@ -220,11 +220,12 @@ impl Library {
     }
 
     /// "Forget" an entry — drop it from the in-memory index and delete the
-    /// `podimo-state.json` marker on disk, but **leave every other file in
-    /// place** (`metadata.json`, the audio file, the cover image, the
-    /// directory itself, the author directory). The book stays visible to
-    /// Audiobookshelf scanning the same volume; only podimo-rs stops
-    /// tracking it.
+    /// `podimo-state.json` marker plus any leftover `<title>.mp3.partial`
+    /// (an in-progress download only podimo-rs ever writes), but **leave
+    /// every other file in place** (`metadata.json`, a finished audio file,
+    /// the cover image, the directory itself, the author directory). The
+    /// book stays visible to Audiobookshelf scanning the same volume; only
+    /// podimo-rs stops tracking it.
     ///
     /// This is the safe semantics for a library shared with an existing ABS
     /// collection: removing a book from the podimo-rs UI never deletes the
@@ -243,6 +244,12 @@ impl Library {
         if let Err(err) = fs::remove_file(&state_file).await {
             if err.kind() != io::ErrorKind::NotFound {
                 tracing::warn!(target: "podimo::library", "delete {}: {err}", state_file.display());
+            }
+        }
+        let partial_file = self.audio_partial_path(&entry);
+        if let Err(err) = fs::remove_file(&partial_file).await {
+            if err.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(target: "podimo::library", "delete {}: {err}", partial_file.display());
             }
         }
         Ok(true)
@@ -630,6 +637,37 @@ mod tests {
             "ABS metadata should remain"
         );
         assert!(dir.parent().unwrap().exists(), "author dir should remain");
+    }
+
+    #[tokio::test]
+    async fn forget_deletes_partial_download_but_leaves_everything_else() {
+        // Forget must clean up our own in-progress `.mp3.partial` file — it's
+        // the one file besides `podimo-state.json` that only podimo-rs ever
+        // writes — while still leaving the finished audio, cover, and ABS
+        // metadata untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = Library::new(tmp.path()).await.unwrap();
+        let e = sample_entry("a1");
+        lib.add(e.clone()).await.unwrap();
+        let dir = lib.entry_dir(&e);
+        let audio = lib.audio_path(&e);
+        let cover = lib.cover_path(&e);
+        let partial = lib.audio_partial_path(&e);
+        std::fs::write(&audio, b"FAKE-AUDIO").unwrap();
+        std::fs::write(&cover, b"FAKE-COVER").unwrap();
+        std::fs::write(&partial, b"IN-PROGRESS").unwrap();
+
+        assert!(lib.remove("a1").await.unwrap());
+
+        assert!(!partial.exists(), "partial download should be deleted");
+        assert!(!lib.state_path(&e).exists(), "state file should be deleted");
+        // Everything else stays — this is still "Forget", not "delete".
+        assert!(audio.exists(), "finished audio should remain");
+        assert!(cover.exists(), "cover should remain");
+        assert!(
+            dir.join(ABS_METADATA_FILE).exists(),
+            "ABS metadata should remain"
+        );
     }
 
     #[tokio::test]
