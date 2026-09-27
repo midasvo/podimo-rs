@@ -96,7 +96,9 @@ unless `STORE_TOKENS_ON_DISK=false`; delete `CACHE_DIR` to forget them.
 Passwords are never logged.
 
 To take feeds offline, list podcast IDs in a `.block-list` file; matching feeds
-return `410 Gone` (see [`.block-list.example`](.block-list.example)).
+return `410 Gone`, whatever the case or percent-encoding of the URL. Episode
+links that podcatchers already have keep working unless you list their episode
+IDs too (see [`.block-list.example`](.block-list.example)).
 
 ## Development
 
