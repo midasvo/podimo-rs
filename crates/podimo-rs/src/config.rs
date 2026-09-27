@@ -46,8 +46,8 @@ pub struct Config {
 
     pub public_feeds: bool,
 
-    /// Format the feed links HLS episodes as: `mp3` (re-encoded, plays
-    /// everywhere) or `m4a` (Podimo's AAC repackaged, near-zero CPU).
+    /// Format the feed links HLS episodes as: `m4a` (default; Podimo's AAC
+    /// repackaged, near-zero CPU) or `mp3` (re-encoded, plays everywhere).
     /// `/stream` serves both either way; this only picks the enclosure.
     pub stream_format: StreamFormat,
 
@@ -146,7 +146,7 @@ fn env_bool(key: &str, default: bool) -> bool {
 /// Unlike the lenient helpers above, a typo here fails startup: silently
 /// falling back would hide which format the feed actually serves.
 fn env_stream_format() -> anyhow::Result<StreamFormat> {
-    let value = env_or("STREAM_FORMAT", "mp3");
+    let value = env_or("STREAM_FORMAT", "m4a");
     StreamFormat::from_extension(&value.trim().to_ascii_lowercase())
         .ok_or_else(|| anyhow::anyhow!("STREAM_FORMAT must be `mp3` or `m4a`, got `{value}`"))
 }

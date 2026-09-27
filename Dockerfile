@@ -33,7 +33,7 @@ RUN cargo build --release --locked --bin podimo-rs
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
 
-# ffmpeg transcodes Podimo's HLS episodes to MP3 (see podimo/hls.rs).
+# ffmpeg turns Podimo's HLS episodes into M4A/MP3 files (see podimo/hls.rs).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget ffmpeg \
     && rm -rf /var/lib/apt/lists/*

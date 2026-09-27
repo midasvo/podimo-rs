@@ -375,16 +375,16 @@ pub async fn log_ffmpeg_status() {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let version: Vec<&str> = stdout.split_whitespace().take(3).collect();
-            tracing::info!(target: "podimo", "MP3 transcoding via {}", version.join(" "));
+            tracing::info!(target: "podimo", "episode conversion via {}", version.join(" "));
         }
         Ok(out) => tracing::warn!(
             target: "podimo",
-            "`{FFMPEG} -version` failed ({}); HLS episodes can't be served as MP3",
+            "`{FFMPEG} -version` failed ({}); HLS episodes can't be served",
             out.status
         ),
         Err(err) => tracing::warn!(
             target: "podimo",
-            "{FFMPEG} not found ({err}); HLS episodes can't be served as MP3"
+            "{FFMPEG} not found ({err}); HLS episodes can't be served"
         ),
     }
 }

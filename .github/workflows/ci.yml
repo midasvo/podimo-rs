@@ -39,7 +39,7 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # The MP3 transcode tests run the real ffmpeg (see podimo/hls.rs).
+      # The transcode tests run the real ffmpeg and ffprobe (see podimo/hls.rs).
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
