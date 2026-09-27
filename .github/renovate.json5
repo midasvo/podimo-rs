@@ -1,0 +1,49 @@
+// Dependency updates by Renovate (Mend's hosted GitHub app).
+// https://docs.renovatebot.com/configuration-options/
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['config:recommended'],
+  timezone: 'Europe/Amsterdam',
+
+  // `cargo update` once a week: every version the Cargo.toml requirements
+  // already allow, transitive crates included. Merges itself once CI passes.
+  lockFileMaintenance: {
+    enabled: true,
+    automerge: true,
+    // Monday before 8:00. Mend runs the app about every 4 hours, so a
+    // shorter window can miss a week.
+    schedule: ['* 0-7 * * 1'],
+  },
+
+  packageRules: [
+    {
+      // Requirements like "0.7" and "1" are caret ranges, and lock file
+      // maintenance already covers everything inside them. Only versions
+      // outside the range get a PR (axum 0.7 -> 0.8, thiserror 1 -> 2). By
+      // Cargo's rules those are breaking, so they are merged by hand.
+      matchManagers: ['cargo'],
+      rangeStrategy: 'replace',
+    },
+    {
+      // bincode is unmaintained; 3.0.0 contains only a compile_error!.
+      matchPackageNames: ['bincode'],
+      enabled: false,
+    },
+    {
+      // The workflows use major tags (@v4), so every update here is a major.
+      // docker-publish.yml doesn't run on PRs: watch its run on main after
+      // merging.
+      matchManagers: ['github-actions'],
+      groupName: 'GitHub Actions',
+    },
+  ],
+
+  // Merge from Renovate itself, which waits for green CI on an up-to-date
+  // branch. GitHub's native auto-merge only waits for required status checks,
+  // and main has none.
+  platformAutomerge: false,
+
+  // Lock file maintenance is created after all other PRs, so with the default
+  // cap of 10 open PRs, unmerged breaking updates could block it.
+  prConcurrentLimit: 0,
+}

@@ -1,0 +1,31 @@
+name: Renovate config
+
+# Renovate reports config errors in an issue, and issues are off in this repo,
+# so a broken config would silently stop the updates. Check it when it changes.
+on:
+  push:
+    branches: [ main ]
+    paths: [ '.github/renovate.json5' ]
+  pull_request:
+    branches: [ main ]
+    paths: [ '.github/renovate.json5' ]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: renovate-config-validator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Current Renovate releases require Node 24.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Without a file argument it finds .github/renovate.json5 and validates
+      # it as repo config. --strict also fails on options that need migrating.
+      - name: Validate
+        run: npx --yes --package renovate -- renovate-config-validator --strict
