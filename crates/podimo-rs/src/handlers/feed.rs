@@ -96,7 +96,22 @@ async fn serve(
     )
     .await
     {
-        Ok(rss) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], rss).into_response(),
+        Ok(rss) => {
+            let episode_count = payload
+                .get("episodes")
+                .and_then(|e| e.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let title = payload
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or(podcast_id);
+            tracing::info!(
+                target: "podimo::feed",
+                "served feed for \"{title}\" ({podcast_id}) with {episode_count} episodes"
+            );
+            (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], rss).into_response()
+        }
         Err(err) => AppError::Internal(format!("rss render: {err}")).into_response(),
     }
 }

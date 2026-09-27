@@ -93,7 +93,17 @@ async fn serve(
     )
     .await
     {
-        Ok(rss) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], rss).into_response(),
+        Ok(rss) => {
+            let title = meta
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or(audiobook_id);
+            tracing::info!(
+                target: "podimo::feed",
+                "served feed for audiobook \"{title}\" ({audiobook_id})"
+            );
+            (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], rss).into_response()
+        }
         Err(err) => AppError::Internal(format!("rss render: {err}")).into_response(),
     }
 }

@@ -18,9 +18,29 @@ impl FormatTime for PodimoTimer {
 }
 
 pub fn init(debug: bool) {
-    let default_level = if debug { "debug" } else { "info" };
-    let filter =
-        EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter = match env::var("RUST_LOG") {
+        Ok(val) if !val.trim().is_empty() => {
+            let filter = EnvFilter::new(&val);
+            if !val.contains("hyper") && !val.contains("reqwest") && !val.contains("h2") {
+                filter
+                    .add_directive("hyper=warn".parse().expect("valid directive"))
+                    .add_directive("hyper_util=warn".parse().expect("valid directive"))
+                    .add_directive("reqwest=warn".parse().expect("valid directive"))
+                    .add_directive("h2=warn".parse().expect("valid directive"))
+                    .add_directive("rustls=warn".parse().expect("valid directive"))
+            } else {
+                filter
+            }
+        }
+        _ => {
+            let default_directives = if debug {
+                "podimo=debug,tower_http=debug,hyper=warn,hyper_util=warn,reqwest=warn,h2=warn,rustls=warn,info"
+            } else {
+                "podimo=info,tower_http=info,hyper=warn,hyper_util=warn,reqwest=warn,h2=warn,rustls=warn,warn"
+            };
+            EnvFilter::new(default_directives)
+        }
+    };
 
     let json = env::var("PODIMO_LOG_JSON")
         .ok()
