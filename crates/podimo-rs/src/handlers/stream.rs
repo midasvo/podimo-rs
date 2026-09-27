@@ -12,10 +12,14 @@
 //! Podimo-hosted playlists are accepted. Anyone who has one enclosure URL can
 //! open it many times, so `podimo::hls` caps how many streams run at once;
 //! when every slot is taken, a request gets a 503 with `Retry-After`.
+//!
+//! The block list is matched against the episode id and the playlist URL.
+//! The link carries no podcast id, so an episode link that's already out
+//! there is stopped by listing the episode's id.
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{header, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -37,6 +41,7 @@ pub(crate) fn router() -> Router<AppState> {
 async fn serve_transcoded(
     State(state): State<AppState>,
     method: Method,
+    uri: Uri,
     Path((token, file)): Path<(String, String)>,
 ) -> Response {
     let Some((episode_id, format)) = file
@@ -52,6 +57,10 @@ async fn serve_transcoded(
         Ok(src) => src,
         Err(err) => return AppError::BadRequest(err.to_string()).into_response(),
     };
+    // The playlist URL is base64 in the path, so check it decoded as well.
+    if state.blocklist.contains_substring(uri.path()) || state.blocklist.contains_substring(&src) {
+        return AppError::Gone.into_response();
+    }
     let segments = match resolve(&state, episode_id, &src).await {
         Ok(segments) => segments,
         Err(resp) => return resp,
@@ -72,6 +81,7 @@ async fn serve_transcoded(
 async fn serve_aac(
     State(state): State<AppState>,
     method: Method,
+    uri: Uri,
     Path(file): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -84,6 +94,11 @@ async fn serve_aac(
     let Some(src) = params.get("src") else {
         return AppError::BadRequest("Missing src".into()).into_response();
     };
+    // The playlist URL is the `src` query parameter here.
+    let path_and_query = uri.path_and_query().map_or("", |p| p.as_str());
+    if state.blocklist.contains_substring(path_and_query) {
+        return AppError::Gone.into_response();
+    }
     let segments = match resolve(&state, episode_id, src).await {
         Ok(segments) => segments,
         Err(resp) => return resp,

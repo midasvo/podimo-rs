@@ -1,6 +1,8 @@
 //! Loads the `.block-list` file. Lines starting with `#` are comments; only
 //! the first whitespace-separated token of each line is used. Matching is
-//! substring against the full request URL (not equality).
+//! substring against the request's path and query (not equality), after
+//! percent-decoding it once and ignoring case, so an id can't slip past the
+//! list as `%2D` for `-` or in upper case.
 
 use std::collections::HashSet;
 use std::fs;
@@ -23,14 +25,23 @@ impl BlockList {
                 continue;
             }
             if let Some(token) = trimmed.split_whitespace().next() {
-                entries.insert(token.to_string());
+                entries.insert(token.to_ascii_lowercase());
             }
         }
         Self(entries)
     }
 
+    /// Whether `url` contains an entry. Decoding once matches what axum's
+    /// `Path` and `Query` extractors do before a handler sees the id.
     pub(crate) fn contains_substring(&self, url: &str) -> bool {
-        self.0.iter().any(|token| url.contains(token))
+        if self.0.is_empty() {
+            return false;
+        }
+        let decoded = urlencoding::decode_binary(url.as_bytes());
+        let normalized = String::from_utf8_lossy(&decoded).to_ascii_lowercase();
+        self.0
+            .iter()
+            .any(|token| normalized.contains(token.as_str()))
     }
 }
 
@@ -87,5 +98,27 @@ mod tests {
         assert!(bl.contains_substring("https://x/ABCDE"));
         // The trailing tail is not stored as a token.
         assert!(!bl.contains_substring("https://x/description"));
+    }
+
+    fn one_entry(entry: &str) -> BlockList {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "{entry}").unwrap();
+        BlockList::load(f.path())
+    }
+
+    #[test]
+    fn matching_ignores_case() {
+        let lower = one_entry("de9b2081-9fc5-489f-b9d3-d744ed9cab20");
+        assert!(lower.contains_substring("/feed/DE9B2081-9FC5-489F-B9D3-D744ED9CAB20.xml"));
+        let upper = one_entry("DE9B2081-9FC5-489F-B9D3-D744ED9CAB20");
+        assert!(upper.contains_substring("/feed/de9b2081-9fc5-489f-b9d3-d744ed9cab20.xml"));
+    }
+
+    #[test]
+    fn matching_sees_through_percent_encoding() {
+        let bl = one_entry("de9b2081-9fc5-489f-b9d3-d744ed9cab20");
+        assert!(bl.contains_substring("/feed/de9b2081%2D9fc5-489f-b9d3-d744ed9cab20.xml"));
+        assert!(bl.contains_substring("/feed/%64e9b2081-9fc5-489f-b9d3-d744ed9cab20.xml"));
+        assert!(!bl.contains_substring("/feed/de9b2081-9fc5-489f-b9d3-d744ed9cab21.xml"));
     }
 }

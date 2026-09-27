@@ -46,7 +46,21 @@ fn make_test_config() -> Config {
 }
 
 async fn boot() -> SocketAddr {
-    let state = AppState::new(make_test_config()).await.unwrap();
+    boot_with(make_test_config()).await
+}
+
+/// Boots with a block list holding `entries`, one per line.
+async fn boot_with_block_list(entries: &[&str]) -> SocketAddr {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), entries.join("\n")).unwrap();
+    let mut config = make_test_config();
+    config.block_list_file = file.path().to_string_lossy().to_string();
+    // The list is read at startup, so the file can go once the app is up.
+    boot_with(config).await
+}
+
+async fn boot_with(config: Config) -> SocketAddr {
+    let state = AppState::new(config).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = app(state).await.unwrap();
@@ -121,6 +135,31 @@ async fn legacy_aac_route_still_validates() {
     )
     .await;
     assert_eq!(resp.status(), 400, "foreign host");
+}
+
+#[tokio::test]
+async fn blocked_episode_returns_410_on_both_routes() {
+    let addr = boot_with_block_list(&[EPISODE]).await;
+    // A playlist on Podimo's CDN: without the block list check, the handler
+    // would go on to fetch it.
+    let src = "https://media-cdn-episodes.podimo.com/a/a.m3u8";
+    let paths = [
+        format!("/stream/{}/{EPISODE}.m4a", token(src)),
+        format!("/stream/{}/{EPISODE}.mp3", token(src)),
+        format!("/stream/{}/{}.m4a", token(src), EPISODE.to_uppercase()),
+        format!("/stream/{EPISODE}.aac?src={}", urlencoding::encode(src)),
+    ];
+    for path in paths {
+        assert_eq!(get(addr, &path).await.status(), 410, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn block_list_matches_the_playlist_url_inside_the_token() {
+    let addr = boot_with_block_list(&["blocked-show"]).await;
+    let src = "https://media-cdn-episodes.podimo.com/blocked-show/ep.m3u8";
+    let resp = get(addr, &format!("/stream/{}/{EPISODE}.m4a", token(src))).await;
+    assert_eq!(resp.status(), 410);
 }
 
 #[tokio::test]

@@ -70,7 +70,8 @@ crates/podimo-rs/tests/       integration tests; Podimo is mocked with wiremock
    `email,region,locale` by default, or `PODIMO_EMAIL`/`PODIMO_PASSWORD` plus
    `?region=&locale=` when `LOCAL_CREDENTIALS=true`. Region and locale default
    to `nl` and `nl-NL`. It also validates the ID and checks the block list
-   (a listed token anywhere in the URL gives `410`).
+   (a listed token anywhere in the percent-decoded URL, in any case, gives
+   `410`). `/stream` checks it too, against the episode id and playlist URL.
 2. `PodimoClient::login` does three GraphQL calls; the token is cached under
    `sha256(user~pass)`. `get_podcasts` pages episodes 100 at a time and
    `?limit` stops after the pages it needs. The listing is cached per account

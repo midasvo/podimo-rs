@@ -440,3 +440,28 @@ async fn blocked_podcast_id_returns_410() {
     assert_eq!(resp.status(), 410);
     handle.abort();
 }
+
+#[tokio::test]
+async fn blocked_podcast_id_returns_410_whatever_its_case_or_encoding() {
+    // The handler percent-decodes the id, and Podimo ids are case-insensitive,
+    // so neither form may slip past the list.
+    let blocklist = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(blocklist.path(), "de9b2081-9fc5-489f-b9d3-d744ed9cab20\n").unwrap();
+    let blocklist_path = blocklist.path().to_string_lossy().to_string();
+    std::mem::forget(blocklist);
+
+    let (addr, handle) = boot_with(|c| c.block_list_file = blocklist_path).await;
+    for id in [
+        "de9b2081%2D9fc5-489f-b9d3-d744ed9cab20",
+        "DE9B2081-9FC5-489F-B9D3-D744ED9CAB20",
+    ] {
+        let resp = http_client()
+            .get(format!("http://{addr}/feed/{id}.xml"))
+            .header("Authorization", basic_auth_header("a@b.com,nl,nl-NL", "pw"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 410, "{id}");
+    }
+    handle.abort();
+}
