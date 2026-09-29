@@ -1,0 +1,34 @@
+// A Debian environment with everything the build and the tests need, for
+// VS Code, Zed, GitHub Codespaces and the devcontainer CLI.
+// https://containers.dev/implementors/json_reference/
+{
+  "name": "podimo-rs",
+  "build": { "dockerfile": "Dockerfile" },
+
+  // Build output goes to a volume per checkout instead of the bind-mounted
+  // source, where cargo is slow on a Windows or macOS host. It also keeps the
+  // container's build apart from a native build's target/.
+  "mounts": [
+    {
+      "type": "volume",
+      "source": "podimo-rs-target-${devcontainerId}",
+      "target": "${containerWorkspaceFolder}/target"
+    }
+  ],
+  // A new volume belongs to root.
+  "postCreateCommand": "sudo chown $(id -u):$(id -g) '${containerWorkspaceFolder}/target'",
+
+  // `cargo run` serves on http://localhost:12104. Zed publishes forwardPorts
+  // on every interface of the host, so publish on loopback only with appPort.
+  // VS Code and Codespaces forward the port too once the server listens.
+  "appPort": ["127.0.0.1:12104:12104"],
+  "portsAttributes": { "12104": { "label": "podimo-rs" } },
+  // A published port arrives on the container's network interface, not on
+  // its loopback. Takes precedence over PODIMO_BIND_HOST in .env.
+  "containerEnv": { "PODIMO_BIND_HOST": "0.0.0.0:12104" },
+
+  // VS Code gets rust-analyzer, Even Better TOML and CodeLLDB from the image.
+  "customizations": {
+    "zed": { "extensions": ["toml"] }
+  }
+}

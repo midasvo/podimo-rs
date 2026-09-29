@@ -29,6 +29,14 @@ The transcode tests in `crates/podimo-rs/src/podimo/hls.rs` invoke the real
 `ffmpeg` binary (via lavfi sine tone generation and ffprobe). CI runs with
 Debian's `ffmpeg` installed.
 
+`.devcontainer/` is a dev container (VS Code, Zed, Codespaces): Debian
+bookworm with Rust and ffmpeg. It keeps `target/` in a Docker volume per
+checkout and publishes port 12104 on the host's loopback only.
+`.github/workflows/devcontainer.yml` builds it and runs fmt, clippy and the
+tests inside whenever `.devcontainer/` changes. `.gitattributes` checks text
+files out with LF, so git inside the container doesn't see a Windows checkout
+as modified.
+
 ## Architecture
 
 A cargo workspace with one binary crate:
