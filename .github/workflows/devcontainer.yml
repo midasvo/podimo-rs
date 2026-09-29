@@ -1,0 +1,36 @@
+name: Dev container
+
+# Builds .devcontainer and runs the CI checks in it, so that a change to the
+# dev container, or a new base image from Renovate, can't break it unnoticed.
+on:
+  push:
+    branches: [ main ]
+    paths: [ '.devcontainer/**', '.github/workflows/devcontainer.yml' ]
+  pull_request:
+    branches: [ main ]
+    paths: [ '.devcontainer/**', '.github/workflows/devcontainer.yml' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt, clippy, test in the dev container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Starts the container like an editor would, postCreateCommand included,
+      # then runs runCmd with `bash -c`: without `set -e` only the last
+      # command's exit status would count.
+      - name: Build the dev container and run the checks
+        uses: devcontainers/ci@v0.3
+        with:
+          push: never
+          env: CARGO_TERM_COLOR=always
+          runCmd: |
+            set -e
+            cargo fmt --all -- --check
+            cargo clippy --all-targets --locked -- -D warnings
+            cargo test --all --locked

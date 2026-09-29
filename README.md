@@ -94,6 +94,8 @@ need:
 | `CACHE_DIR` | `./cache` | Cached login tokens and episode lists. |
 | `SCRAPER_API`, `ZENROWS_API`, `HTTP_PROXY` | – | Proxy for Podimo's API. Needed when Cloudflare blocks your IP, which is common from data centers. |
 | `ENABLE_LIBRARY` | `false` | Download audiobooks to `LIBRARY_DIR` in an Audiobookshelf-compatible layout. Requires `LOCAL_CREDENTIALS=true`. |
+| `DEBUG` | `false` | Logs podimo-rs's debug messages, and every setting at startup. |
+| `RUST_LOG` | – | Log filter ([`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax) replacing the defaults. hyper, reqwest, h2 and rustls stay at `warn` unless it names them. |
 
 Login tokens give full access to a Podimo account. They are cached on disk
 unless `STORE_TOKENS_ON_DISK=false`; delete `CACHE_DIR` to forget them.
@@ -106,13 +108,35 @@ IDs too (see [`.block-list.example`](.block-list.example)).
 
 ## Development
 
-Requires Rust and, for episode conversion and its tests, `ffmpeg` on `PATH`.
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/midasvo/podimo-rs)
 
-```sh
-cp .env.example .env
-cargo run --bin podimo-rs
-cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --all --locked
+The repository has a [dev container](https://containers.dev): a Debian
+environment with Rust, rustfmt, clippy, rust-analyzer and the ffmpeg that the
+tests need. Open it with one of:
+
+- **GitHub Codespaces**: the button above. Runs in the browser, so there's
+  nothing to install.
+- **Zed**: open the folder and accept the prompt to open it in a dev container.
+  Needs Docker.
+- **VS Code**: install the Dev Containers extension and run *Dev Containers:
+  Reopen in Container*. Needs Docker.
+
+Then, in the container's terminal:
+
+```bash
+cargo test                        # all tests
+cargo clippy --all-targets        # CI fails on any warning
+cargo fmt --all
+cargo run                         # the server, on http://localhost:12104
 ```
+
+`cargo run` reads `.env`; copy `.env.example` to start one. The container keeps
+`target/` in a Docker volume per checkout, which is faster than the bind mount
+on Windows and macOS and keeps it apart from a native build. To find old ones
+to remove, run `docker volume ls --filter name=podimo-rs-target`.
+
+Without the container you need Rust 1.88 or newer, a C compiler, and `ffmpeg`
+and `ffprobe` on your `PATH` for the transcode tests.
 
 ## License
 

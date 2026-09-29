@@ -23,6 +23,14 @@ CI runs these on PRs and `main`. Pushes to `main` publish
 `ghcr.io/midasvo/podimo-rs:latest`; `vX.Y.Z` tags publish versioned images
 (bump `crates/podimo-rs/Cargo.toml` to match first).
 
+`.devcontainer/` is a dev container (VS Code, Zed, Codespaces): Debian
+bookworm with Rust and ffmpeg. It keeps `target/` in a Docker volume per
+checkout and publishes port 12104 on the host's loopback only.
+`.github/workflows/devcontainer.yml` builds it and runs fmt, clippy and the
+tests inside whenever `.devcontainer/` changes. `.gitattributes` checks text
+files out with LF, so git inside the container doesn't see a Windows checkout
+as modified.
+
 Renovate (`.github/renovate.json5`, checked by `renovate-config.yml`) runs
 `cargo update` early on Mondays and merges that PR itself once CI passes, so
 `:latest` picks up compatible crate releases weekly. Versions outside a
@@ -165,6 +173,17 @@ status gives length `0` (not cached) and no answer at all an error.
 Startup deletes the bincode files that 1.2.0 and earlier left in
 `<CACHE_DIR>/*_cache/`.
 
+## Logging
+
+Lines are `LEVEL | timestamp | message`, or JSON with `PODIMO_LOG_JSON=true`.
+`telemetry.rs` logs our own targets (`podimo`, `podimo::<area>`) at INFO, or
+DEBUG with `DEBUG=true`, and other crates at WARN (INFO with `DEBUG=true`).
+`RUST_LOG` replaces that, but hyper, reqwest, h2 and rustls stay at WARN unless
+it names one of them: at DEBUG they log every pooled connection.
+`middleware.rs` logs each request except `/healthz` (5xx at ERROR, 4xx at
+WARN), with the `/stream` token masked, and a streamed `/stream` body logs
+whether it finished, failed upstream or lost its client.
+
 ## Gotchas
 
 - `util::amp_arg` also accepts `amp;region`/`amp;locale`: some clients,
@@ -175,8 +194,6 @@ Startup deletes the bincode files that 1.2.0 and earlier left in
   `SCRAPER_API`, `ZENROWS_API` and `HTTP_PROXY` are checked in that order.
   Errors from `post_graphql` name only the host, never the proxy URL with its
   key.
-- Logs are `LEVEL | timestamp | message`. `RUST_LOG` sets the level and
-  `PODIMO_LOG_JSON=true` switches to JSON.
 - Newer clippy flags `Result<_, Response>` as `result_large_err`. Handlers
   allow it locally because the error goes straight back to axum.
 - The disk mirror must stay JSON or another self-describing format:

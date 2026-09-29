@@ -36,6 +36,8 @@ pub async fn run(
     audiobook_id: String,
     cover_url: Option<String>,
 ) {
+    tracing::info!(target: "podimo::library", "starting download for audiobook {audiobook_id}");
+    let start = Instant::now();
     let result = perform(
         &library,
         &podimo,
@@ -46,6 +48,23 @@ pub async fn run(
         cover_url.as_deref(),
     )
     .await;
+
+    match &result {
+        Ok(size) => {
+            let mb = *size as f64 / (1024.0 * 1024.0);
+            tracing::info!(
+                target: "podimo::library",
+                "completed download for audiobook {audiobook_id} ({mb:.2} MB in {:.1?})",
+                start.elapsed()
+            );
+        }
+        Err(msg) => {
+            tracing::error!(
+                target: "podimo::library",
+                "download failed for audiobook {audiobook_id}: {msg}"
+            );
+        }
+    }
 
     let _ = library
         .update(&audiobook_id, |e| match &result {

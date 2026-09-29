@@ -1,0 +1,4 @@
+# Check out text files with LF, on Windows too. The dev container sees a
+# Windows checkout through a bind mount, and git in there, which has no
+# core.autocrlf, would report every CRLF file as modified.
+* text=auto eol=lf
