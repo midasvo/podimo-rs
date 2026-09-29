@@ -130,11 +130,12 @@ pub(crate) async fn authorize_request(
     };
     let cached_token = state.caches.tokens.get(&client.key).await;
     let token_from_cache = cached_token.is_some();
+    // No email in these: on a shared instance, they're other people's.
     if let Some(token) = cached_token {
-        tracing::debug!(target: "podimo::auth", "reusing cached token for {}", client.username);
+        tracing::debug!(target: "podimo::auth", "reusing cached token");
         client.token = Some(token);
     } else {
-        tracing::info!(target: "podimo::auth", "logging in for {} (region: {region})", client.username);
+        tracing::info!(target: "podimo::auth", "logging in to Podimo (region: {region})");
         match client.login(&state.scraper, &state.config).await {
             Ok(token) => state.caches.tokens.insert(client.key.clone(), token).await,
             Err(ClientError::InvalidCredentials(_)) => {
