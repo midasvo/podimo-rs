@@ -95,7 +95,7 @@ async fn serve(
     {
         Ok(rss) => {
             let title = meta
-                .get("title")
+                .pointer("/audiobookById/title")
                 .and_then(|t| t.as_str())
                 .unwrap_or(audiobook_id);
             tracing::info!(

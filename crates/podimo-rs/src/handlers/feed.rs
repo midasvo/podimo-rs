@@ -97,15 +97,16 @@ async fn serve(
     .await
     {
         Ok(rss) => {
-            let episode_count = payload
-                .get("episodes")
-                .and_then(|e| e.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
             let title = payload
-                .get("title")
+                .pointer("/podcast/title")
                 .and_then(|t| t.as_str())
                 .unwrap_or(podcast_id);
+            // The cached payload can hold more episodes than the feed shows.
+            let available = payload
+                .get("episodes")
+                .and_then(|e| e.as_array())
+                .map_or(0, Vec::len);
+            let episode_count = limit.map_or(available, |n| n.min(available));
             tracing::info!(
                 target: "podimo::feed",
                 "served feed for \"{title}\" ({podcast_id}) with {episode_count} episodes"

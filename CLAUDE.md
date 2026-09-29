@@ -157,6 +157,16 @@ stay on disk: `get` skips them, `get_stale` returns them too. `url_head_info`
 caches only 2xx answers. It retries a 5xx like a timeout or connection error,
 and falls back to an expired size when every attempt fails.
 
+## Logging
+
+`telemetry.rs` logs our own targets (`podimo`, `podimo::<area>`) at INFO, or
+DEBUG with `DEBUG=true`, and other crates at WARN (INFO with `DEBUG=true`).
+`RUST_LOG` replaces that, but hyper, reqwest, h2 and rustls stay at WARN unless
+it names one of them: at DEBUG they log every pooled connection.
+`middleware.rs` logs each request except `/healthz` (5xx at ERROR, 4xx at
+WARN), with the `/stream` token masked, and a streamed `/stream` body logs
+whether it finished, failed upstream or lost its client.
+
 ## Code style
 
 - Formatting: `cargo fmt` with default settings (2024 edition style).

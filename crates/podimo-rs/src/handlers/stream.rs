@@ -23,10 +23,10 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Instant;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -93,17 +93,7 @@ async fn serve_m4a(state: &AppState, episode_id: &str, src: &str, request: Reque
             return match resolve(state, episode_id, src.as_str()).await {
                 Ok(_) => {
                     let format = StreamFormat::M4a;
-                    (
-                        [
-                            (header::CONTENT_TYPE, format.content_type().to_string()),
-                            (
-                                header::CONTENT_DISPOSITION,
-                                content_disposition(episode_id, format.extension()),
-                            ),
-                        ],
-                        Body::empty(),
-                    )
-                        .into_response()
+                    audio_head(episode_id, format.extension(), format.content_type())
                 }
                 Err(resp) => resp,
             };
@@ -147,7 +137,7 @@ async fn prepare_m4a(
         .map_err(|err| match *err {
             HlsError::Busy => start_failed(episode_id, HlsError::Busy),
             HlsError::Upstream(_) | HlsError::Unsupported(_) => {
-                tracing::warn!(target: "podimo", "stream {episode_id}: {err}");
+                tracing::warn!(target: "podimo::stream", "stream {episode_id}: {err}");
                 AppError::UpstreamUnavailable(err.to_string()).into_response()
             }
             _ => AppError::Internal(format!("stream {episode_id}: {err}")).into_response(),
@@ -183,17 +173,7 @@ async fn stream_mp3(state: &AppState, episode_id: &str, src: &str, method: &Meth
     // take a stream slot) for a body axum throws away anyway.
     let format = StreamFormat::Mp3;
     if method == Method::HEAD {
-        return (
-            [
-                (header::CONTENT_TYPE, format.content_type().to_string()),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("inline; filename=\"{episode_id}.{}\"", format.extension()),
-                ),
-            ],
-            Body::empty(),
-        )
-            .into_response();
+        return audio_head(episode_id, format.extension(), format.content_type());
     }
     let aac = hls::aac_stream(state.scraper.clone(), segments, hls::SEGMENT_PREFETCH);
     match hls::transcode_mp3(aac).await {
@@ -229,17 +209,7 @@ async fn serve_aac(
     };
     // As above: a HEAD response has no body to hold a stream slot for.
     if method == Method::HEAD {
-        return (
-            [
-                (header::CONTENT_TYPE, hls::AAC_CONTENT_TYPE.to_string()),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("inline; filename=\"{episode_id}.aac\""),
-                ),
-            ],
-            Body::empty(),
-        )
-            .into_response();
+        return audio_head(episode_id, "aac", hls::AAC_CONTENT_TYPE);
     }
     let aac = hls::aac_stream(state.scraper.clone(), segments, hls::SEGMENT_PREFETCH);
     match hls::with_stream_slot(aac).await {
@@ -253,7 +223,7 @@ async fn serve_aac(
 fn start_failed(episode_id: &str, err: HlsError) -> Response {
     match err {
         HlsError::Busy => {
-            tracing::warn!(target: "podimo", "stream {episode_id}: {err}");
+            tracing::warn!(target: "podimo::stream", "stream {episode_id}: {err}");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 [(header::RETRY_AFTER, "30")],
@@ -280,12 +250,11 @@ fn check_episode_id(id: &str) -> Result<(), Response> {
 #[allow(clippy::result_large_err)]
 async fn resolve(state: &AppState, episode_id: &str, src: &str) -> Result<Vec<Url>, Response> {
     let src = hls::validate_source(src)
-        .map_err(|err| AppError::BadRequest(err.to_string()).into_response())?
-        .clone();
+        .map_err(|err| AppError::BadRequest(err.to_string()).into_response())?;
     let segments = hls::resolve_segments(&state.scraper, &src)
         .await
         .map_err(|err| {
-            tracing::warn!(target: "podimo", "stream {episode_id}: {err}");
+            tracing::warn!(target: "podimo::stream", "stream {episode_id}: {err}");
             AppError::UpstreamUnavailable(err.to_string()).into_response()
         })?;
     tracing::info!(target: "podimo::stream", "stream {episode_id}: resolved {} segments", segments.len());
@@ -296,85 +265,26 @@ fn content_disposition(episode_id: &str, ext: &str) -> String {
     format!("inline; filename=\"{episode_id}.{ext}\"")
 }
 
-struct TrackedStream {
-    inner: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, HlsError>> + Send>>,
-    id: String,
-    ext: String,
-    bytes: u64,
-    start: Instant,
-    completed: bool,
+/// The answer to HEAD while there's no file to measure: the headers a GET
+/// gets, minus the length. The body is an empty stream rather than
+/// `Body::empty()`, which axum would announce as `Content-Length: 0`.
+fn audio_head(episode_id: &str, ext: &str, content_type: &str) -> Response {
+    let empty = futures::stream::empty::<Result<Bytes, HlsError>>();
+    with_audio_headers(episode_id, ext, content_type, Body::from_stream(empty))
 }
 
-impl TrackedStream {
-    fn new<S>(stream: S, id: String, ext: String) -> Self
-    where
-        S: Stream<Item = Result<axum::body::Bytes, HlsError>> + Send + 'static,
-    {
-        Self {
-            inner: Box::pin(stream),
-            id,
-            ext,
-            bytes: 0,
-            start: Instant::now(),
-            completed: false,
-        }
-    }
-}
-
-impl Drop for TrackedStream {
-    fn drop(&mut self) {
-        if !self.completed && self.bytes > 0 {
-            let duration = self.start.elapsed();
-            let mb = self.bytes as f64 / (1024.0 * 1024.0);
-            tracing::info!(
-                target: "podimo::stream",
-                "stream {}.{} ended by client after {:.2} MB ({duration:.1?})",
-                self.id,
-                self.ext,
-                mb,
-            );
-        }
-    }
-}
-
-impl Stream for TrackedStream {
-    type Item = Result<axum::body::Bytes, HlsError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.as_mut().get_mut();
-        match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                this.bytes += bytes.len() as u64;
-                Poll::Ready(Some(Ok(bytes)))
-            }
-            Poll::Ready(Some(Err(err))) => {
-                tracing::warn!(target: "podimo::stream", "stream {}.{} aborted: {err}", this.id, this.ext);
-                Poll::Ready(Some(Err(err)))
-            }
-            Poll::Ready(None) => {
-                this.completed = true;
-                let duration = this.start.elapsed();
-                let mb = this.bytes as f64 / (1024.0 * 1024.0);
-                tracing::info!(
-                    target: "podimo::stream",
-                    "finished streaming {}.{} ({:.2} MB in {duration:.1?})",
-                    this.id,
-                    this.ext,
-                    mb,
-                );
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
+/// `body` streamed as the episode's audio, logging how the transfer ends.
 fn audio_response<S>(episode_id: &str, ext: &str, content_type: &str, body: S) -> Response
 where
-    S: Stream<Item = Result<axum::body::Bytes, HlsError>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, HlsError>> + Send + 'static,
 {
-    tracing::info!(target: "podimo::stream", "started streaming {episode_id}.{ext}");
-    let tracked = TrackedStream::new(body, episode_id.to_string(), ext.to_string());
+    let name = format!("{episode_id}.{ext}");
+    tracing::info!(target: "podimo::stream", "stream {name}: started");
+    let body = Body::from_stream(TrackedStream::new(body, name));
+    with_audio_headers(episode_id, ext, content_type, body)
+}
+
+fn with_audio_headers(episode_id: &str, ext: &str, content_type: &str, body: Body) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type.to_string()),
@@ -383,9 +293,70 @@ where
                 content_disposition(episode_id, ext),
             ),
         ],
-        Body::from_stream(tracked),
+        body,
     )
         .into_response()
+}
+
+/// A response body that logs how it ends: finished, failed upstream, or
+/// dropped before either, which means the client went away.
+struct TrackedStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, HlsError>> + Send>>,
+    name: String,
+    bytes: u64,
+    started: Instant,
+    ended: bool,
+}
+
+impl TrackedStream {
+    fn new<S>(inner: S, name: String) -> Self
+    where
+        S: Stream<Item = Result<Bytes, HlsError>> + Send + 'static,
+    {
+        Self {
+            inner: Box::pin(inner),
+            name,
+            bytes: 0,
+            started: Instant::now(),
+            ended: false,
+        }
+    }
+
+    /// How much went out so far, e.g. `12.3 MB in 45.6s`.
+    fn progress(&self) -> String {
+        let mb = self.bytes as f64 / (1024.0 * 1024.0);
+        format!("{mb:.1} MB in {:.1?}", self.started.elapsed())
+    }
+}
+
+impl Stream for TrackedStream {
+    type Item = Result<Bytes, HlsError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = ready!(self.inner.as_mut().poll_next(cx));
+        match &item {
+            Some(Ok(chunk)) => self.bytes += chunk.len() as u64,
+            // Headers are long gone by the time a mid-stream error happens,
+            // so this is the only place it gets reported.
+            Some(Err(err)) => {
+                self.ended = true;
+                tracing::warn!(target: "podimo::stream", "stream {}: aborted after {}: {err}", self.name, self.progress());
+            }
+            None => {
+                self.ended = true;
+                tracing::info!(target: "podimo::stream", "stream {}: finished, {}", self.name, self.progress());
+            }
+        }
+        Poll::Ready(item)
+    }
+}
+
+impl Drop for TrackedStream {
+    fn drop(&mut self) {
+        if !self.ended {
+            tracing::info!(target: "podimo::stream", "stream {}: client left after {}", self.name, self.progress());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -435,5 +406,37 @@ mod tests {
             "bytes 4-9/10"
         );
         assert_eq!(body, b"456789");
+    }
+
+    #[tokio::test]
+    async fn head_leaves_out_the_length() {
+        // Routed like the real handlers, since axum is what adds the length.
+        let app: Router = Router::new().route(
+            "/{file}",
+            get(|| async { audio_head(EPISODE, "mp3", "audio/mpeg") }),
+        );
+        let request = Request::head(format!("/{EPISODE}.mp3"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_value(&response, header::CONTENT_TYPE), "audio/mpeg");
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+    }
+
+    #[tokio::test]
+    async fn an_upstream_failure_is_not_blamed_on_the_client() {
+        use futures::StreamExt;
+
+        let chunks = [
+            Ok(Bytes::from_static(b"abc")),
+            Err(HlsError::Upstream("segment 2 failed".into())),
+        ];
+        let mut body = TrackedStream::new(futures::stream::iter(chunks), "episode.mp3".into());
+        assert!(body.next().await.unwrap().is_ok());
+        assert!(!body.ended, "a drop now would mean the client left");
+        assert!(body.next().await.unwrap().is_err());
+        assert!(body.ended);
+        assert_eq!(body.bytes, 3);
     }
 }

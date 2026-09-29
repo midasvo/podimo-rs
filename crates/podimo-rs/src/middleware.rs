@@ -20,7 +20,6 @@ pub(crate) async fn after_request(
     let path = req.uri().path().to_owned();
 
     let mut response = next.run(req).await;
-    let is_success = response.status().is_success();
     let status = response.status();
     let headers = response.headers_mut();
 
@@ -43,7 +42,7 @@ pub(crate) async fn after_request(
     // Only content may be cached. The HTML pages show state that changes
     // (library downloads) or credentials (the generated feed URL), and a
     // browser may answer a navigation from a cached copy.
-    let cc = if is_content && is_success {
+    let cc = if is_content && status.is_success() {
         "max-age=900"
     } else {
         "no-store"
@@ -86,4 +85,19 @@ fn sanitize_path_for_log(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_tokens_stay_out_of_the_log() {
+        assert_eq!(
+            sanitize_path_for_log("/stream/aHR0cHM6Ly9wb2RpbW8/ep.m4a"),
+            "/stream/[token]/ep.m4a"
+        );
+        assert_eq!(sanitize_path_for_log("/stream/ep.aac"), "/stream/ep.aac");
+        assert_eq!(sanitize_path_for_log("/feed/abc.xml"), "/feed/abc.xml");
+    }
 }
