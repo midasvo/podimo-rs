@@ -575,8 +575,8 @@ async fn fetch_segment(client: &Client, url: &Url, timeout: Duration) -> Result<
             Ok(bytes) => return Ok(bytes),
             Err(err) => {
                 let msg = describe(err);
-                tracing::info!(
-                    target: "podimo",
+                tracing::warn!(
+                    target: "podimo::hls",
                     "segment fetch failed (attempt {}/{SEGMENT_RETRIES}): {msg}",
                     attempt + 1,
                 );

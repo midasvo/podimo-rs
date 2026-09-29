@@ -1,4 +1,6 @@
-//! After-request CORS + Cache-Control middleware.
+//! After-request CORS + Cache-Control middleware and request logging.
+
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -13,11 +15,12 @@ pub(crate) async fn after_request(
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    let start = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
 
     let mut response = next.run(req).await;
-    let is_success = response.status().is_success();
+    let status = response.status();
     let headers = response.headers_mut();
 
     // Feeds and episode audio: what podcatchers fetch, from any origin.
@@ -39,12 +42,62 @@ pub(crate) async fn after_request(
     // Only content may be cached. The HTML pages show state that changes
     // (library downloads) or credentials (the generated feed URL), and a
     // browser may answer a navigation from a cached copy.
-    let cc = if is_content && is_success {
+    let cc = if is_content && status.is_success() {
         "max-age=900"
     } else {
         "no-store"
     };
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cc));
 
+    // Milestone access log for content and app routes (silences /healthz polling)
+    if path != "/healthz" {
+        let display_path = sanitize_path_for_log(&path);
+        let elapsed = start.elapsed();
+        let status_code = status.as_u16();
+
+        if status.is_server_error() {
+            tracing::error!(
+                target: "podimo::http",
+                "{method} {display_path} -> {status_code} ({elapsed:.1?})",
+            );
+        } else if status.is_client_error() {
+            tracing::warn!(
+                target: "podimo::http",
+                "{method} {display_path} -> {status_code} ({elapsed:.1?})",
+            );
+        } else {
+            tracing::info!(
+                target: "podimo::http",
+                "{method} {display_path} -> {status_code} ({elapsed:.1?})",
+            );
+        }
+    }
+
     response
+}
+
+/// Sanitize paths with large tokens (like `/stream/<base64_token>/<id>.ext`)
+/// so logs stay readable and signed URLs aren't dumped verbatim.
+fn sanitize_path_for_log(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("/stream/") {
+        if let Some((_token, file)) = rest.split_once('/') {
+            return format!("/stream/[token]/{file}");
+        }
+    }
+    path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_tokens_stay_out_of_the_log() {
+        assert_eq!(
+            sanitize_path_for_log("/stream/aHR0cHM6Ly9wb2RpbW8/ep.m4a"),
+            "/stream/[token]/ep.m4a"
+        );
+        assert_eq!(sanitize_path_for_log("/stream/ep.aac"), "/stream/ep.aac");
+        assert_eq!(sanitize_path_for_log("/feed/abc.xml"), "/feed/abc.xml");
+    }
 }

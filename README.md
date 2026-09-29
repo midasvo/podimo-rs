@@ -99,7 +99,9 @@ All configuration is done via environment variables (or `.env` file):
 | `AUDIOBOOK_META_CACHE_TIME` | `21600` (6h) | Audiobook metadata cache TTL in seconds. |
 | `AUDIOBOOK_AUDIO_CACHE_TIME` | `600` (10m) | Audiobook audio URL cache TTL in seconds. |
 | `URL_HEAD_CACHE_TIME` | `604800` (7d) | HEAD response file size cache TTL in seconds. |
-| `DEBUG` | `false` | Enables verbose debug logging. |
+| `DEBUG` | `false` | Logs podimo-rs's debug messages, and every setting at startup. |
+| `RUST_LOG` | None | Log filter ([`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax) replacing the defaults. hyper, reqwest, h2 and rustls stay at `warn` unless it names them. |
+| `PODIMO_LOG_JSON` | `false` | Logs as JSON instead of text. |
 
 ## License
 

@@ -131,8 +131,10 @@ pub(crate) async fn authorize_request(
     let cached_token = state.caches.tokens.get(&client.key).await;
     let token_from_cache = cached_token.is_some();
     if let Some(token) = cached_token {
+        tracing::debug!(target: "podimo::auth", "reusing cached token for {}", client.username);
         client.token = Some(token);
     } else {
+        tracing::info!(target: "podimo::auth", "logging in for {} (region: {region})", client.username);
         match client.login(&state.scraper, &state.config).await {
             Ok(token) => state.caches.tokens.insert(client.key.clone(), token).await,
             Err(ClientError::InvalidCredentials(_)) => {

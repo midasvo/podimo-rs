@@ -114,31 +114,40 @@ impl Config {
     }
 
     pub fn log_startup(&self) {
+        tracing::info!(
+            target: "podimo",
+            "podimo-rs starting up (version {}, bind: {}, protocol: {}, format: {}, library: {})",
+            env!("CARGO_PKG_VERSION"),
+            self.bind_host,
+            self.protocol,
+            self.stream_format.extension(),
+            self.enable_library,
+        );
         if !self.debug {
             return;
         }
-        tracing::info!(target: "podimo", "DEBUG: {}", self.debug);
-        tracing::info!(target: "podimo", "LOCAL_CREDENTIALS: {} ({:?})", self.local_credentials, self.podimo_email);
-        tracing::info!(target: "podimo", "PODIMO_REGION: {}, PODIMO_LOCALE: {}", self.podimo_region, self.podimo_locale);
-        tracing::info!(target: "podimo", "PODIMO_HOSTNAME: {}", self.hostname);
-        tracing::info!(target: "podimo", "PODIMO_BIND_HOST: {}", self.bind_host);
-        tracing::info!(target: "podimo", "PODIMO_PROTOCOL: {}", self.protocol);
-        tracing::info!(target: "podimo", "PUBLIC_FEEDS: {}", self.public_feeds);
-        tracing::info!(target: "podimo", "STREAM_FORMAT: {}", self.stream_format.extension());
-        tracing::info!(target: "podimo", "STREAM_LINKS_FROM_REQUEST: {}", self.stream_links_from_request);
+        tracing::debug!(target: "podimo", "DEBUG: {}", self.debug);
+        tracing::debug!(target: "podimo", "LOCAL_CREDENTIALS: {} ({:?})", self.local_credentials, self.podimo_email);
+        tracing::debug!(target: "podimo", "PODIMO_REGION: {}, PODIMO_LOCALE: {}", self.podimo_region, self.podimo_locale);
+        tracing::debug!(target: "podimo", "PODIMO_HOSTNAME: {}", self.hostname);
+        tracing::debug!(target: "podimo", "PODIMO_BIND_HOST: {}", self.bind_host);
+        tracing::debug!(target: "podimo", "PODIMO_PROTOCOL: {}", self.protocol);
+        tracing::debug!(target: "podimo", "PUBLIC_FEEDS: {}", self.public_feeds);
+        tracing::debug!(target: "podimo", "STREAM_FORMAT: {}", self.stream_format.extension());
+        tracing::debug!(target: "podimo", "STREAM_LINKS_FROM_REQUEST: {}", self.stream_links_from_request);
         // A proxy URL can hold `user:password@`, so only say whether it's set.
-        tracing::info!(target: "podimo", "HTTP_PROXY set: {}", self.http_proxy.is_some());
-        tracing::info!(target: "podimo", "ZENROWS_API set: {}", self.zenrows_api.is_some());
-        tracing::info!(target: "podimo", "SCRAPER_API set: {}", self.scraper_api.is_some());
-        tracing::info!(target: "podimo", "CACHE_DIR: {}", self.cache_dir);
-        tracing::info!(target: "podimo", "STORE_TOKENS_ON_DISK: {}", self.store_tokens_on_disk);
-        tracing::info!(target: "podimo", "TOKEN_CACHE_TIME: {} sec", self.token_cache_time);
-        tracing::info!(target: "podimo", "PODCAST_CACHE_TIME: {} sec", self.podcast_cache_time);
-        tracing::info!(target: "podimo", "HEAD_CACHE_TIME: {} sec", self.head_cache_time);
-        tracing::info!(target: "podimo", "AUDIOBOOK_AUDIO_CACHE_TIME: {} sec", self.audiobook_audio_cache_time);
-        tracing::info!(target: "podimo", "ENABLE_LIBRARY: {}", self.enable_library);
+        tracing::debug!(target: "podimo", "HTTP_PROXY set: {}", self.http_proxy.is_some());
+        tracing::debug!(target: "podimo", "ZENROWS_API set: {}", self.zenrows_api.is_some());
+        tracing::debug!(target: "podimo", "SCRAPER_API set: {}", self.scraper_api.is_some());
+        tracing::debug!(target: "podimo", "CACHE_DIR: {}", self.cache_dir);
+        tracing::debug!(target: "podimo", "STORE_TOKENS_ON_DISK: {}", self.store_tokens_on_disk);
+        tracing::debug!(target: "podimo", "TOKEN_CACHE_TIME: {} sec", self.token_cache_time);
+        tracing::debug!(target: "podimo", "PODCAST_CACHE_TIME: {} sec", self.podcast_cache_time);
+        tracing::debug!(target: "podimo", "HEAD_CACHE_TIME: {} sec", self.head_cache_time);
+        tracing::debug!(target: "podimo", "AUDIOBOOK_AUDIO_CACHE_TIME: {} sec", self.audiobook_audio_cache_time);
+        tracing::debug!(target: "podimo", "ENABLE_LIBRARY: {}", self.enable_library);
         if self.enable_library {
-            tracing::info!(target: "podimo", "LIBRARY_DIR: {}", self.library_dir);
+            tracing::debug!(target: "podimo", "LIBRARY_DIR: {}", self.library_dir);
         }
     }
 }
