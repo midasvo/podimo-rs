@@ -36,7 +36,7 @@ impl Templates {
         ctx: &S,
     ) -> Result<String, minijinja::Error> {
         let tmpl = self.env.get_template(name)?;
-        tmpl.render(ctx)
+        tmpl.render(minijinja::value::Serde(ctx))
     }
 }
 
