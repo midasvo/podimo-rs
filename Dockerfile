@@ -1,11 +1,11 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.28
 # Multi-stage build using `cargo-chef` to keep dep compilation in its own
 # layer. The dep layer only invalidates when `Cargo.toml` / `Cargo.lock`
 # change, so source-only edits skip ~150 transitive crate compiles and the
 # build finishes in seconds instead of minutes.
 
 # ---- chef base: rust toolchain + cargo-chef ----
-FROM rust:1.98-slim-bookworm AS chef
+FROM rust:1.99-slim-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /build
 
