@@ -36,12 +36,39 @@ impl Templates {
         ctx: &S,
     ) -> Result<String, minijinja::Error> {
         let tmpl = self.env.get_template(name)?;
-        tmpl.render(ctx)
+        tmpl.render(minijinja::value::Serde(ctx))
     }
 }
 
 impl Default for Templates {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_unpacks_serialized_region_tuples() {
+        #[derive(serde::Serialize)]
+        struct Ctx {
+            regions: &'static [(&'static str, &'static str)],
+            locales: &'static [&'static str],
+        }
+
+        let html = Templates::new()
+            .render(
+                "index.html",
+                &Ctx {
+                    regions: &[("nl", "Nederland")],
+                    locales: &["nl-NL"],
+                },
+            )
+            .unwrap();
+
+        assert!(html.contains(r#"<option value="nl">Nederland</option>"#));
+        assert!(html.contains("<option>nl-NL</option>"));
     }
 }
