@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.28
 # Multi-stage build using `cargo-chef` to keep dep compilation in its own
 # layer. The dep layer only invalidates when `Cargo.toml` / `Cargo.lock`
 # change, so source-only edits skip ~150 transitive crate compiles and the
